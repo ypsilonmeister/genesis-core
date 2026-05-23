@@ -116,7 +116,7 @@ Gemini CLI の `@file.md` syntax を積極的に使う:
 ## 開発フェーズの現在地
 
 - [x] Week 1: Gemini はまだ実行されない (orchestrator 骨格通電が先)
-- [ ] Week 2: Gemini API キーの動作確認 (`tests/gemini_smoke.rs`)
+- [x] Week 2: Gemini API キーの動作確認 (`tests/gemini_smoke.rs`)
 - [ ] Week 3: 攻撃 AI Phase A 解放、初回攻撃ログ記録
 - [ ] Week 4: diversity score の運用開始
 
