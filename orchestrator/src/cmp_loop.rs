@@ -296,7 +296,10 @@ impl CmpLoop {
             .iter()
             .zip(chain_module_names.iter())
             .map(|(path, name)| {
-                let code = self.executor.read_file(path).unwrap_or_default();
+                let code = self.executor.read_file(path).unwrap_or_else(|e| {
+                    warn!(path = %path, err = %e, "Tier 2: cannot read charter source");
+                    String::new()
+                });
                 format!("[{}]\n{}", name, extract_charter(&code))
             })
             .collect();
@@ -373,6 +376,7 @@ impl CmpLoop {
 
             let build_result = self.executor.cargo_build(target).await?;
             let build_ok = build_result.success;
+            let build_error = build_result.stderr;
             let test_ok = build_ok && self.executor.cargo_test(target).await?;
 
             if !test_ok {
@@ -387,7 +391,7 @@ impl CmpLoop {
                     model_name: self.model_name.clone(),
                     generated_code: Some(new_code),
                     build_result: if build_ok { "success" } else { "failure" }.to_string(),
-                    build_error: None,
+                    build_error,
                     test_result: Some("fail".to_string()),
                     decision: "rejected".to_string(),
                     rejection_reason: Some("build or test failed".to_string()),
