@@ -77,34 +77,41 @@ fn module_binary(name: &str) -> PathBuf {
     workspace_root().join("target").join("debug").join(name)
 }
 
-/// UDS socket が accept できるまで最大 5 秒待つ。
+/// UDS socket が accept できるまで最大 5 秒待つ。タイムアウト時は false を返す。
 async fn wait_for_socket(path: &str) -> bool {
-    for _ in 0..50 {
-        if UnixStream::connect(path).await.is_ok() {
-            return true;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if UnixStream::connect(path).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    false
+    })
+    .await
+    .is_ok()
 }
 
-/// socket に 1 リクエストを送り ModuleResponse を返す。
+/// socket に 1 リクエストを送り ModuleResponse を返す。10 秒でタイムアウト。
 async fn call(socket_path: &str, req_id: &str, input: &str) -> anyhow::Result<ModuleResponse> {
-    let mut stream = UnixStream::connect(socket_path).await?;
-    let req = ModuleRequest {
-        request_id: req_id.to_string(),
-        input: input.to_string(),
-        // chrono::DateTime<Utc> は RFC3339 文字列を受け付ける
-        timestamp: "2026-01-01T00:00:00Z".to_string(),
-    };
-    let mut payload = serde_json::to_vec(&req)?;
-    payload.push(b'\n');
-    stream.write_all(&payload).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = UnixStream::connect(socket_path).await?;
+        let req = ModuleRequest {
+            request_id: req_id.to_string(),
+            input: input.to_string(),
+            // chrono::DateTime<Utc> は RFC3339 文字列を受け付ける
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let mut payload = serde_json::to_vec(&req)?;
+        payload.push(b'\n');
+        stream.write_all(&payload).await?;
 
-    let mut reader = tokio::io::BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
-    serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("response parse error: {e}"))
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("response parse error: {e}"))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("call to {} timed out after 10s", socket_path))?
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +191,7 @@ impl Drop for Chain {
     fn drop(&mut self) {
         for p in &mut self.procs {
             let _ = p.kill();
+            let _ = p.wait(); // kill 後すぐ wait してゾンビプロセスを回収する
         }
         let _ = std::fs::remove_dir_all(&self.sock_dir);
     }
@@ -299,6 +307,19 @@ async fn e2e_each_stage_produces_output() {
     assert!(eval.error.is_none());
     let eval_out = eval.output.expect("evaluator must produce output");
     assert_eq!(eval_out, "5", "2 + 3 must be 5");
+}
+
+/// 空白正規化: normalizer が余分な空白を除去してから計算できる
+#[tokio::test]
+async fn e2e_whitespace_normalization() {
+    let chain = Chain::spawn("ws").await.unwrap();
+    let result = run_chain(&chain, "req-ws", "  3  +  5  ")
+        .await
+        .expect("chain failed");
+    assert_eq!(
+        result, "8",
+        "excess whitespace must be normalized before evaluation"
+    );
 }
 
 /// processing_ms 契約: 各モジュールは処理時間を u64 として返す

@@ -59,16 +59,19 @@ genesis-core/
 │   └── README.md
 ├── orchestrator/              # 不可侵領域 (CMP §8.3)
 │   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs
-│       ├── attacker.rs        # 攻撃 AI 呼び出し (Gemini)
-│       ├── chain.rs           # chain.toml 読み込み
-│       ├── charter_runtime.rs # Layer B 橋渡し
-│       ├── cmp_loop.rs        # Tier 1 / Tier 2 ループ
-│       ├── hot_swap.rs        # 無停止プロセス入替
-│       ├── ipc.rs             # UDS + JSON
-│       ├── metadata.rs        # SQLite 追記
-│       └── process.rs         # サブプロセス管理
+│   ├── src/
+│   │   ├── main.rs
+│   │   ├── attacker.rs        # 攻撃 AI 呼び出し (Gemini)
+│   │   ├── chain.rs           # chain.toml 読み込み
+│   │   ├── charter_runtime.rs # Layer B 橋渡し
+│   │   ├── cmp_loop.rs        # Tier 1 / Tier 2 ループ
+│   │   ├── executor.rs        # cargo/fs/hot_swap の抽象化
+│   │   ├── hot_swap.rs        # 無停止プロセス入替
+│   │   ├── ipc.rs             # UDS + JSON
+│   │   ├── metadata.rs        # SQLite 追記
+│   │   └── process.rs         # サブプロセス管理
+│   └── tests/
+│       └── ipc_chain_e2e.rs   # Layer 3: UDS E2E テスト (実プロセス + JSON 契約)
 ├── modules/                   # Cognitive Modules (Tier 1 で AI が改変)
 │   ├── normalizer/
 │   ├── tokenizer/
@@ -76,7 +79,8 @@ genesis-core/
 │   └── evaluator/
 ├── archive/                   # 旧バイナリ退避 (gitignore)
 └── .github/
-    └── workflows/             # CI (将来追加)
+    └── workflows/
+        └── ci.yml             # build → test → clippy
 ```
 
 ---
@@ -99,7 +103,15 @@ cargo build --workspace
 
 ### テスト
 
+> **重要**: 統合テスト (`ipc_chain_e2e`) は実バイナリを必要とするため、
+> `cargo test` の前に必ず `cargo build --workspace` を実行すること。
+> CI も同じ順序で実行する (`ci.yml` 参照)。
+
 ```bash
+# 1. モジュールバイナリをビルド (統合テストの前提条件)
+cargo build --workspace
+
+# 2. 全テスト実行
 cargo test --workspace
 ```
 
@@ -127,10 +139,11 @@ cargo run -p orchestrator
 
 ## 開発フェーズ
 
-- [ ] **Week 1** — 4 モジュールが UDS で繋がり `"3 + 5 * 2"` → `13` が end-to-end で通る
-- [ ] **Week 2** — Tier 1 修復ループ (Claude API + cargo build + hot swap)
-- [ ] **Week 3** — Tier 2 ループ + 攻撃 AI Phase A 解放
-- [ ] **Week 4** — 把握テスト + 30 日連続運転開始
+- [x] **Week 1** — 4 モジュールが UDS で繋がり `"3 + 5 * 2"` → `13` が end-to-end で通る
+- [x] **Week 2** — Tier 1 修復ループ (Claude API + cargo build + hot swap)
+- [x] **Week 3** — Tier 2 ループ + 攻撃 AI Phase A 解放
+- [x] **Week 4** — 把握テスト + 30 日連続運転開始
+- [x] **テスト整備** — Layer 2 (Executor mock) + Layer 3 (IPC E2E) + CI
 
 ---
 

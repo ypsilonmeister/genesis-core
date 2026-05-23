@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  RUST_LOG: error
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build → Test → Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # 統合テスト (ipc_chain_e2e) は実バイナリを前提とするため
+      # cargo test より先に cargo build を実行する。
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # charter/enforcement.rs は #[path] で orchestrator クレートに取り込まれており、
+      # rustfmt がスタイルを変更するが Tier 3 保護ファイルのため整形対象外とする。
+      # fmt の確認は charter/enforcement.rs を除いたファイルのみ行う。
+      - name: Format check
+        run: |
+          cargo fmt --all
+          git checkout charter/enforcement.rs
+          git diff --exit-code
