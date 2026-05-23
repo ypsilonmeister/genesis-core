@@ -5,14 +5,14 @@
 // 起動時の読み込みと、ホットリロード(SIGHUP 等)を担当する。
 // =============================================================================
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChainConfig {
     pub modules: Vec<ModuleSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModuleSpec {
     pub name: String,
     /// 起動するバイナリの相対パス (workspace target ディレクトリからの相対)
@@ -26,5 +26,11 @@ impl ChainConfig {
         let raw = std::fs::read_to_string(path)?;
         let config: ChainConfig = toml::from_str(&raw)?;
         Ok(config)
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let raw = toml::to_string_pretty(self)?;
+        std::fs::write(path, raw)?;
+        Ok(())
     }
 }

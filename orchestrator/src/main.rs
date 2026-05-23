@@ -348,6 +348,18 @@ async fn main() -> Result<()> {
                             spawn_and_insert_module(&mut processes, spec).await?;
                             error_counts.remove("UnknownPattern");
                             unknown_pattern_examples.clear();
+
+                            // chain.toml を永続化
+                            let mut new_config = ChainConfig { modules: Vec::new() };
+                            for (m_spec, _) in &processes {
+                                new_config.modules.push(m_spec.clone());
+                            }
+                            if let Err(e) = new_config.save(chain_path) {
+                                error!(err = %e, "Failed to persist chain.toml");
+                            } else {
+                                info!("chain.toml persisted with new module");
+                            }
+
                             // §5 把握テスト (Tier 2 new module)
                             if let Ok(code) = std::fs::read_to_string(&new_mod_src) {
                                 if let Err(e) = cmp

@@ -215,11 +215,11 @@ pub fn rand_attack_delay_secs() -> u64 {
     let min = std::env::var("ATTACK_INTERVAL_MIN_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30u64);
+        .unwrap_or(1200u64); // 20 min
     let max = std::env::var("ATTACK_INTERVAL_MAX_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(180u64);
+        .unwrap_or(3600u64); // 60 min
 
     if min >= max {
         return min;
