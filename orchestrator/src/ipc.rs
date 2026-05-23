@@ -59,9 +59,12 @@ impl ErrorCode {
 }
 
 /// UDS 経由でリクエストを送り、レスポンスを待つ
-pub async fn call_module(socket_path: &str, request: &ModuleRequest) -> anyhow::Result<ModuleResponse> {
+pub async fn call_module(
+    socket_path: &str,
+    request: &ModuleRequest,
+) -> anyhow::Result<ModuleResponse> {
     let mut stream = UnixStream::connect(socket_path).await?;
-    
+
     // JSON L (Line-delimited JSON) で送受信
     let mut payload = serde_json::to_vec(request)?;
     payload.push(b'\n');
@@ -70,7 +73,7 @@ pub async fn call_module(socket_path: &str, request: &ModuleRequest) -> anyhow::
     let mut reader = tokio::io::BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
-    
+
     let response: ModuleResponse = serde_json::from_str(&line)?;
     Ok(response)
 }

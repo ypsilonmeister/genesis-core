@@ -255,6 +255,7 @@ async fn main() -> Result<()> {
                             })
                             .await?;
 
+                        let mod_name_t1 = m_cfg.name.clone();
                         let new_proc = ModuleProcess {
                             name: m_cfg.name.clone(),
                             child: new_child,
@@ -265,6 +266,16 @@ async fn main() -> Result<()> {
                             RepairOutcome::Adopted => {
                                 info!(error_code = %error_code, "Tier 1: repair adopted");
                                 error_counts.remove(&error_code);
+                                // §5 把握テスト
+                                let sp = format!("modules/{}/src/main.rs", mod_name_t1);
+                                if let Ok(code) = std::fs::read_to_string(&sp) {
+                                    if let Err(e) = cmp
+                                        .run_comprehension_test(&mod_name_t1, &code, &metadata)
+                                        .await
+                                    {
+                                        warn!(err = %e, "comprehension test failed");
+                                    }
+                                }
                             }
                             RepairOutcome::Rejected { reason } => {
                                 warn!(error_code = %error_code, reason = %reason, "Tier 1: repair rejected");
@@ -319,12 +330,33 @@ async fn main() -> Result<()> {
                                     }
                                     Err(e) => warn!(err = %e, "Tier 2 hot_swap failed"),
                                 }
+                                // §5 把握テスト (Tier 2 extend)
+                                let sp = format!("modules/{}/src/main.rs", module_name);
+                                if let Ok(code) = std::fs::read_to_string(&sp) {
+                                    if let Err(e) = cmp
+                                        .run_comprehension_test(&module_name, &code, &metadata)
+                                        .await
+                                    {
+                                        warn!(err = %e, "comprehension test failed (tier2 extend)");
+                                    }
+                                }
                             }
                         }
                         Tier2Outcome::NewModule(spec) => {
+                            let new_mod_name = spec.name.clone();
+                            let new_mod_src = format!("modules/{}/src/main.rs", new_mod_name);
                             spawn_and_insert_module(&mut processes, spec).await?;
                             error_counts.remove("UnknownPattern");
                             unknown_pattern_examples.clear();
+                            // §5 把握テスト (Tier 2 new module)
+                            if let Ok(code) = std::fs::read_to_string(&new_mod_src) {
+                                if let Err(e) = cmp
+                                    .run_comprehension_test(&new_mod_name, &code, &metadata)
+                                    .await
+                                {
+                                    warn!(err = %e, "comprehension test failed (tier2 new)");
+                                }
+                            }
                         }
                         Tier2Outcome::Rejected { reason } => {
                             warn!(reason = %reason, "Tier 2: rejected");

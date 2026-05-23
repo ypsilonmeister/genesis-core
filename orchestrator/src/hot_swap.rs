@@ -41,14 +41,19 @@ impl HotSwapper {
         self.archive_old_binary()?;
 
         // 2. 旧プロセスを kill
-        old_child.kill().await.context("Failed to kill old process")?;
-        old_child.wait().await.context("Failed to wait for old process")?;
+        old_child
+            .kill()
+            .await
+            .context("Failed to kill old process")?;
+        old_child
+            .wait()
+            .await
+            .context("Failed to wait for old process")?;
         info!(module = %self.module_name, "hot_swap: old process terminated");
 
         // 3. 既存の socket ファイルを削除 (残留すると bind できない)
         if Path::new(&self.socket_path).exists() {
-            std::fs::remove_file(&self.socket_path)
-                .context("Failed to remove stale socket")?;
+            std::fs::remove_file(&self.socket_path).context("Failed to remove stale socket")?;
         }
 
         // 4. 新プロセスを起動

@@ -36,7 +36,9 @@ pub struct ClaudeCli {
 
 impl Default for ClaudeCli {
     fn default() -> Self {
-        Self { binary: "claude".to_string() }
+        Self {
+            binary: "claude".to_string(),
+        }
     }
 }
 
@@ -51,11 +53,15 @@ impl AiBackend for ClaudeCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("claude cli exited with {}: {}", output.status, stderr.trim());
+            bail!(
+                "claude cli exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
         }
 
-        let text = String::from_utf8(output.stdout)
-            .context("claude cli output was not valid UTF-8")?;
+        let text =
+            String::from_utf8(output.stdout).context("claude cli output was not valid UTF-8")?;
         Ok(text.trim().to_string())
     }
 }
@@ -66,7 +72,9 @@ pub struct GeminiCli {
 
 impl Default for GeminiCli {
     fn default() -> Self {
-        Self { binary: "gemini".to_string() }
+        Self {
+            binary: "gemini".to_string(),
+        }
     }
 }
 
@@ -74,18 +82,22 @@ impl Default for GeminiCli {
 impl AiBackend for GeminiCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
         let output = tokio::process::Command::new(&self.binary)
-            .args(["-p", prompt])
+            .args(["-p", prompt, "-y"])
             .output()
             .await
             .with_context(|| format!("Failed to run '{}'", self.binary))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("gemini cli exited with {}: {}", output.status, stderr.trim());
+            bail!(
+                "gemini cli exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
         }
 
-        let text = String::from_utf8(output.stdout)
-            .context("gemini cli output was not valid UTF-8")?;
+        let text =
+            String::from_utf8(output.stdout).context("gemini cli output was not valid UTF-8")?;
         Ok(text.trim().to_string())
     }
 }
@@ -102,7 +114,11 @@ pub struct ClaudeApi {
 
 impl ClaudeApi {
     pub fn new(api_key: String, model: String) -> Self {
-        Self { api_key, model, client: reqwest::Client::new() }
+        Self {
+            api_key,
+            model,
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -127,7 +143,8 @@ impl AiBackend for ClaudeApi {
             "messages": [{"role": "user", "content": prompt}]
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -140,8 +157,13 @@ impl AiBackend for ClaudeApi {
             bail!("Anthropic API returned {}", resp.status());
         }
 
-        let data: ClaudeResponse = resp.json().await.context("Failed to parse Anthropic response")?;
-        let text = data.content.into_iter()
+        let data: ClaudeResponse = resp
+            .json()
+            .await
+            .context("Failed to parse Anthropic response")?;
+        let text = data
+            .content
+            .into_iter()
             .find(|c| c.kind == "text")
             .map(|c| c.text)
             .unwrap_or_default();
@@ -157,7 +179,11 @@ pub struct GeminiApi {
 
 impl GeminiApi {
     pub fn new(api_key: String, model: String) -> Self {
-        Self { api_key, model, client: reqwest::Client::new() }
+        Self {
+            api_key,
+            model,
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -192,7 +218,8 @@ impl AiBackend for GeminiApi {
             "contents": [{"parts": [{"text": prompt}]}]
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .json(&body)
             .send()
@@ -203,8 +230,13 @@ impl AiBackend for GeminiApi {
             bail!("Gemini API returned {}", resp.status());
         }
 
-        let data: GeminiResponse = resp.json().await.context("Failed to parse Gemini response")?;
-        let text = data.candidates.into_iter()
+        let data: GeminiResponse = resp
+            .json()
+            .await
+            .context("Failed to parse Gemini response")?;
+        let text = data
+            .candidates
+            .into_iter()
             .next()
             .and_then(|c| c.content.parts.into_iter().next())
             .map(|p| p.text)
@@ -227,11 +259,14 @@ pub fn build_claude_backend() -> Result<Box<dyn AiBackend>> {
         "api" => {
             let key = std::env::var("ANTHROPIC_API_KEY")
                 .context("ANTHROPIC_API_KEY is required when CLAUDE_BACKEND=api")?;
-            let model = std::env::var("CLAUDE_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+            let model =
+                std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
             Ok(Box::new(ClaudeApi::new(key, model)))
         }
-        other => bail!("Unknown CLAUDE_BACKEND value: '{}' (expected 'cli' or 'api')", other),
+        other => bail!(
+            "Unknown CLAUDE_BACKEND value: '{}' (expected 'cli' or 'api')",
+            other
+        ),
     }
 }
 
@@ -245,10 +280,13 @@ pub fn build_gemini_backend() -> Result<Box<dyn AiBackend>> {
         "api" => {
             let key = std::env::var("GEMINI_API_KEY")
                 .context("GEMINI_API_KEY is required when GEMINI_BACKEND=api")?;
-            let model = std::env::var("GEMINI_MODEL")
-                .unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+            let model =
+                std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
             Ok(Box::new(GeminiApi::new(key, model)))
         }
-        other => bail!("Unknown GEMINI_BACKEND value: '{}' (expected 'cli' or 'api')", other),
+        other => bail!(
+            "Unknown GEMINI_BACKEND value: '{}' (expected 'cli' or 'api')",
+            other
+        ),
     }
 }

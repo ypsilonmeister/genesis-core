@@ -22,9 +22,9 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -101,7 +101,10 @@ impl Parser {
     pub fn parse(&mut self) -> Result<Expr, ParseError> {
         let expr = self.parse_expr()?;
         if self.pos < self.tokens.len() {
-            return Err(ParseError::Syntax(format!("Unexpected token at {}", self.pos)));
+            return Err(ParseError::Syntax(format!(
+                "Unexpected token at {}",
+                self.pos
+            )));
         }
         Ok(expr)
     }
@@ -117,12 +120,20 @@ impl Parser {
                 Token::Plus => {
                     self.consume();
                     let rhs = self.parse_mul_div()?;
-                    lhs = Expr::BinOp { op: BinOp::Add, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                    lhs = Expr::BinOp {
+                        op: BinOp::Add,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
                 }
                 Token::Minus => {
                     self.consume();
                     let rhs = self.parse_mul_div()?;
-                    lhs = Expr::BinOp { op: BinOp::Sub, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                    lhs = Expr::BinOp {
+                        op: BinOp::Sub,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
                 }
                 _ => break,
             }
@@ -137,12 +148,20 @@ impl Parser {
                 Token::Star => {
                     self.consume();
                     let rhs = self.parse_primary()?;
-                    lhs = Expr::BinOp { op: BinOp::Mul, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                    lhs = Expr::BinOp {
+                        op: BinOp::Mul,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
                 }
                 Token::Slash => {
                     self.consume();
                     let rhs = self.parse_primary()?;
-                    lhs = Expr::BinOp { op: BinOp::Div, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                    lhs = Expr::BinOp {
+                        op: BinOp::Div,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
                 }
                 _ => break,
             }
@@ -206,7 +225,9 @@ async fn main() -> Result<()> {
             let mut line = String::new();
 
             if let Ok(n) = reader.read_line(&mut line).await {
-                if n == 0 { return; }
+                if n == 0 {
+                    return;
+                }
                 let start = std::time::Instant::now();
                 let request: ModuleRequest = match serde_json::from_str(&line) {
                     Ok(req) => req,
@@ -229,11 +250,14 @@ async fn main() -> Result<()> {
                         let json = serde_json::to_string(&expr).unwrap();
                         (Some(json), None)
                     }
-                    Err(e) => (None, Some(ModuleError {
-                        code: "SYNTAX_ERROR".to_string(),
-                        message: e.to_string(),
-                        input_position: None,
-                    })),
+                    Err(e) => (
+                        None,
+                        Some(ModuleError {
+                            code: "SYNTAX_ERROR".to_string(),
+                            message: e.to_string(),
+                            input_position: None,
+                        }),
+                    ),
                 };
 
                 let response = ModuleResponse {
@@ -255,8 +279,8 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,parser=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,parser=debug"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 

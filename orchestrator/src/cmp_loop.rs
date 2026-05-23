@@ -531,6 +531,87 @@ impl CmpLoop {
             }))
         }
     }
+
+    /// §5 把握テスト: モジュールのソースを読んで Claude が要約を生成し、
+    /// Charter の What と照合して comprehension_tests テーブルに記録する。
+    pub async fn run_comprehension_test(
+        &self,
+        module_name: &str,
+        source_code: &str,
+        metadata: &MetadataStore,
+    ) -> Result<()> {
+        let charter_what = extract_charter_what(source_code);
+
+        // Step 1: Claude にモジュールの1文要約を生成させる
+        let summary_prompt = format!(
+            "以下のRustモジュールを読んで、このモジュールが外部からどのように使われるか \
+            (何を受け取り何を返すか) を1文で説明してください。説明のみを出力し、他の文字は不要です。\n\n\
+            ```rust\n{source_code}\n```"
+        );
+
+        let generated_summary = self
+            .claude
+            .complete(&summary_prompt)
+            .await
+            .context("Claude failed to generate comprehension summary")?;
+        let generated_summary = generated_summary.trim().to_string();
+
+        // Step 2: 要約と Charter の What を比較させる
+        let judge_prompt = format!(
+            "以下の2つのテキストを比較してください。\n\n\
+            [LLMが生成した要約]\n{generated_summary}\n\n\
+            [Module Charterの What]\n{charter_what}\n\n\
+            JSONのみで回答してください (説明不要):\n\
+            {{\"match\": \"match\" or \"mismatch\", \"split_candidate\": 0 or 1}}\n\n\
+            判定基準:\n\
+            - match: 要約とCharterのWhatが意味的に一致する\n\
+            - split_candidate=1: モジュールが複数の独立した責任を持ち、分割が検討されるべきなら1"
+        );
+
+        let judge_response = self
+            .claude
+            .complete(&judge_prompt)
+            .await
+            .context("Claude failed to judge comprehension")?;
+
+        let judgment = parse_json_response(&judge_response)
+            .unwrap_or_else(|_| serde_json::json!({"match": "mismatch", "split_candidate": 0}));
+
+        let match_result = judgment["match"].as_str().unwrap_or("mismatch");
+        let split_candidate = judgment["split_candidate"].as_i64().unwrap_or(0) as i32;
+
+        info!(
+            module = %module_name,
+            match_result,
+            split_candidate,
+            "comprehension test completed"
+        );
+        if match_result == "mismatch" {
+            warn!(
+                module = %module_name,
+                summary = %generated_summary,
+                charter_what = %charter_what,
+                "comprehension mismatch detected — module may have drifted from Charter"
+            );
+        }
+        if split_candidate == 1 {
+            warn!(
+                module = %module_name,
+                "split_candidate flagged — module may need to be split (Tier 3)"
+            );
+        }
+
+        metadata.insert_comprehension_test(
+            module_name,
+            &self.model_name,
+            &generated_summary,
+            &charter_what,
+            match_result,
+            split_candidate,
+        )?;
+
+        Ok(())
+    }
 }
 
 /// JSON レスポンスから値を抽出する (コードフェンスを剥がす)。
@@ -570,6 +651,17 @@ pub struct NewModuleSpec {
     pub binary_path: String,
     pub socket_path: String,
     pub insert_after: Option<String>,
+}
+
+/// Charter コメントの What: 行を抽出する。
+fn extract_charter_what(code: &str) -> String {
+    for line in code.lines() {
+        let trimmed = line.trim().trim_start_matches('/').trim();
+        if trimmed.starts_with("What:") {
+            return trimmed.trim_start_matches("What:").trim().to_string();
+        }
+    }
+    "(no What section found)".to_string()
 }
 
 /// ソースコード冒頭の CMP Module Charter コメントブロックを抽出する。

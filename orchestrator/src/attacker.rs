@@ -103,13 +103,50 @@ impl Attacker {
             ""
         };
 
-        let phase_examples = match self.phase.as_str() {
-            "A" => "- 全角数字: \"３ + ５ * ２\"\n- 全角演算子: \"3 ＋ 5 × 2\"\n- 全角括弧: \"（3 + 5）* 2\"\n- ゼロ幅スペース混入\n- 余分な空白・改行: \"3  +\\n5 *  2\"",
-            "B" => "- 通貨記号: \"$3 + €5\"\n- 単位混入: \"3kg + 5kg\"\n- パーセント: \"50% + 30%\"",
-            "C" => "- 自然言語: \"three plus five times two\"\n- 日本語: \"三足す五かける二\"\n- 混合: \"3 plus 5 * 2\"",
-            "D" => "- 未知関数: \"sin(30) + cos(60)\"\n- べき乗: \"2^10\"\n- 対数: \"log(100)\"",
-            _ => "- 全角文字、不可視文字、余分な空白",
+        // 現在の Phase 以下の全 Phase の例を累積して提示する (Week 4 から全解放)
+        let phase_level = match self.phase.as_str() {
+            "A" => 1u8,
+            "B" => 2,
+            "C" => 3,
+            _ => 4,
         };
+        let mut examples_parts: Vec<&str> = Vec::new();
+        if phase_level >= 1 {
+            examples_parts.push(
+                "Phase A (文字レベル):\n\
+                - 全角数字: \"３ + ５ * ２\"\n\
+                - 全角演算子: \"3 ＋ 5 × 2\"\n\
+                - 全角括弧: \"（3 + 5）* 2\"\n\
+                - ゼロ幅スペース混入\n\
+                - 余分な空白・改行: \"3  +\\n5 *  2\"",
+            );
+        }
+        if phase_level >= 2 {
+            examples_parts.push(
+                "Phase B (語彙レベル):\n\
+                - 通貨記号: \"$3 + €5\"\n\
+                - 単位混入: \"3kg + 5kg\"\n\
+                - パーセント: \"50% + 30%\"",
+            );
+        }
+        if phase_level >= 3 {
+            examples_parts.push(
+                "Phase C (意味レベル):\n\
+                - 自然言語: \"three plus five times two\"\n\
+                - 日本語: \"三足す五かける二\"\n\
+                - 混合: \"3 plus 5 * 2\"",
+            );
+        }
+        if phase_level >= 4 {
+            examples_parts.push(
+                "Phase D (構造レベル):\n\
+                - 未知関数: \"sin(30) + cos(60)\"\n\
+                - べき乗: \"2^10\" または \"2**10\"\n\
+                - 対数: \"log(100)\"\n\
+                - 連鎖計算: \"ans + 5\"",
+            );
+        }
+        let phase_examples = examples_parts.join("\n\n");
 
         format!(
             "あなたは数式パーサーのファジングエージェントです。\
@@ -118,7 +155,7 @@ impl Attacker {
             直近のエラーを引き起こした入力: {errors_str}\n\n\
             目標: これまでに成功していない新しい失敗パターンを発見する。\
             同じパターンの繰り返しは避けること。\n\n\
-            Phase {phase} 攻撃例:\n{phase_examples}\
+            解放済み攻撃パターン例 (Phase {phase} まで):\n{phase_examples}\
             {diversity_hint}\n\n\
             出力形式: JSON配列のみ。説明不要。1〜5個の入力を生成してください。\n\
             例: [\"３ + ５\", \"3　+　5\"]",

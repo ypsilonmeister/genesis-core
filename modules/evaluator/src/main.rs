@@ -22,9 +22,9 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
-use std::env;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -121,7 +121,9 @@ async fn main() -> Result<()> {
             let mut line = String::new();
 
             if let Ok(n) = reader.read_line(&mut line).await {
-                if n == 0 { return; }
+                if n == 0 {
+                    return;
+                }
                 let start = std::time::Instant::now();
                 let request: ModuleRequest = match serde_json::from_str(&line) {
                     Ok(req) => req,
@@ -146,11 +148,14 @@ async fn main() -> Result<()> {
                             EvalError::DivisionByZero => "DIVISION_BY_ZERO",
                             EvalError::Overflow(_) => "OVERFLOW",
                         };
-                        (None, Some(ModuleError {
-                            code: code.to_string(),
-                            message: e.to_string(),
-                            input_position: None,
-                        }))
+                        (
+                            None,
+                            Some(ModuleError {
+                                code: code.to_string(),
+                                message: e.to_string(),
+                                input_position: None,
+                            }),
+                        )
                     }
                 };
 
@@ -199,6 +204,9 @@ mod tests {
             lhs: Box::new(Expr::Number(3.0)),
             rhs: Box::new(Expr::Number(0.0)),
         };
-        assert!(matches!(evaluate(&expr).unwrap_err(), EvalError::DivisionByZero));
+        assert!(matches!(
+            evaluate(&expr).unwrap_err(),
+            EvalError::DivisionByZero
+        ));
     }
 }

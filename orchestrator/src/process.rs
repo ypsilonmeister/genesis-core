@@ -1,5 +1,5 @@
-use tokio::process::{Child, Command};
 use std::process::Stdio;
+use tokio::process::{Child, Command};
 
 pub struct ModuleProcess {
     #[allow(dead_code)]

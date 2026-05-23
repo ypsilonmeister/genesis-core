@@ -158,6 +158,34 @@ impl MetadataStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn insert_comprehension_test(
+        &self,
+        module_name: &str,
+        judge_model: &str,
+        generated_summary: &str,
+        charter_what: &str,
+        match_result: &str,
+        split_candidate: i32,
+    ) -> Result<i64> {
+        enforce_hard_invariants(
+            Actor::RepairAi,
+            &Action::DbOperation {
+                sql: "INSERT".to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Charter violation: {:?}", e))?;
+
+        let ts = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO comprehension_tests
+             (timestamp, module_name, judge_model, generated_summary, charter_what, match_result, split_candidate)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![ts, module_name, judge_model, generated_summary, charter_what, match_result, split_candidate],
+        ).context("Failed to insert comprehension test")?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
     #[allow(dead_code)]
     pub fn insert_module_snapshot(
         &self,
