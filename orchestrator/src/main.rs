@@ -19,6 +19,7 @@ mod attacker;
 mod chain;
 mod charter_runtime;
 mod cmp_loop;
+mod executor;
 mod hot_swap;
 mod ipc;
 mod metadata;

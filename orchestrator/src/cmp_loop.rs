@@ -27,6 +27,7 @@ use tracing::{info, warn};
 
 use crate::ai_backend::AiBackend;
 use crate::charter_runtime::{enforce_hard_invariants, Action, Actor};
+use crate::executor::{Executor, SystemExecutor};
 use crate::hot_swap::HotSwapper;
 use crate::metadata::{MetadataStore, ModificationRecord};
 
@@ -48,12 +49,17 @@ pub struct RepairContext<'a> {
 
 pub struct CmpLoop {
     claude: Box<dyn AiBackend>,
+    executor: Box<dyn Executor>,
     pub tier1_trigger: u32,
     pub model_name: String,
 }
 
 impl CmpLoop {
     pub fn new(claude: Box<dyn AiBackend>) -> Self {
+        Self::new_with_executor(claude, Box::new(SystemExecutor))
+    }
+
+    pub fn new_with_executor(claude: Box<dyn AiBackend>, executor: Box<dyn Executor>) -> Self {
         let tier1_trigger = std::env::var("TIER1_TRIGGER_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -61,6 +67,7 @@ impl CmpLoop {
         let model_name = std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-cli".to_string());
         Self {
             claude,
+            executor,
             tier1_trigger,
             model_name,
         }
@@ -84,7 +91,9 @@ impl CmpLoop {
         }
 
         // モジュールのソースコードと Charter を読む
-        let module_code = std::fs::read_to_string(module_source_path)
+        let module_code = self
+            .executor
+            .read_file(module_source_path)
             .with_context(|| format!("Cannot read {}", module_source_path))?;
 
         let module_charter = extract_charter(&module_code);
@@ -139,28 +148,27 @@ impl CmpLoop {
 
         // バックアップ → ファイル書き込み
         let backup_path = format!("{}.bak", module_source_path);
-        std::fs::copy(module_source_path, &backup_path)
+        self.executor
+            .copy_file(module_source_path, &backup_path)
             .context("Failed to backup module source")?;
-        std::fs::write(module_source_path, &generated_code)
+        self.executor
+            .write_file(module_source_path, &generated_code)
             .context("Failed to write repair proposal to source file")?;
 
         // cargo build
-        let build_output = tokio::process::Command::new("cargo")
-            .args(["build", "-p", module_name])
-            .output()
+        let build_result = self
+            .executor
+            .cargo_build(module_name)
             .await
             .context("Failed to run cargo build")?;
 
-        let build_ok = build_output.status.success();
-        let build_error = if build_ok {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&build_output.stderr).to_string())
-        };
+        let build_ok = build_result.success;
+        let build_error = build_result.stderr;
 
         if !build_ok {
             warn!(module = %module_name, "Tier 1: build failed, restoring backup");
-            std::fs::copy(&backup_path, module_source_path)
+            self.executor
+                .copy_file(&backup_path, module_source_path)
                 .context("Failed to restore backup after build failure")?;
 
             let rec = ModificationRecord {
@@ -190,18 +198,17 @@ impl CmpLoop {
         }
 
         // cargo test
-        let test_output = tokio::process::Command::new("cargo")
-            .args(["test", "-p", module_name])
-            .output()
+        let test_ok = self
+            .executor
+            .cargo_test(module_name)
             .await
             .context("Failed to run cargo test")?;
-
-        let test_ok = test_output.status.success();
         let test_result = if test_ok { "pass" } else { "fail" };
 
         if !test_ok {
             warn!(module = %module_name, "Tier 1: tests failed, restoring backup");
-            std::fs::copy(&backup_path, module_source_path)
+            self.executor
+                .copy_file(&backup_path, module_source_path)
                 .context("Failed to restore backup after test failure")?;
 
             let rec = ModificationRecord {
@@ -233,8 +240,9 @@ impl CmpLoop {
         // hot_swap
         info!(module = %module_name, "Tier 1: build+test passed, initiating hot_swap");
         let adopted_at = Utc::now().to_rfc3339();
-        let new_child = hot_swapper
-            .swap(old_child)
+        let new_child = self
+            .executor
+            .hot_swap(hot_swapper, old_child)
             .await
             .context("hot_swap failed")?;
 
@@ -288,7 +296,7 @@ impl CmpLoop {
             .iter()
             .zip(chain_module_names.iter())
             .map(|(path, name)| {
-                let code = std::fs::read_to_string(path).unwrap_or_default();
+                let code = self.executor.read_file(path).unwrap_or_default();
                 format!("[{}]\n{}", name, extract_charter(&code))
             })
             .collect();
@@ -328,7 +336,9 @@ impl CmpLoop {
                 .position(|n| n == target)
                 .unwrap_or(0);
             let source_path = &module_source_paths[idx];
-            let module_code = std::fs::read_to_string(source_path)
+            let module_code = self
+                .executor
+                .read_file(source_path)
                 .with_context(|| format!("Cannot read {}", source_path))?;
             let module_charter = extract_charter(&module_code);
 
@@ -358,25 +368,15 @@ impl CmpLoop {
 
             // バックアップ → 書き込み → build → test
             let backup = format!("{}.bak", source_path);
-            std::fs::copy(source_path, &backup)?;
-            std::fs::write(source_path, &new_code)?;
+            self.executor.copy_file(source_path, &backup)?;
+            self.executor.write_file(source_path, &new_code)?;
 
-            let build_ok = tokio::process::Command::new("cargo")
-                .args(["build", "-p", target])
-                .output()
-                .await?
-                .status
-                .success();
-            let test_ok = build_ok
-                && tokio::process::Command::new("cargo")
-                    .args(["test", "-p", target])
-                    .output()
-                    .await?
-                    .status
-                    .success();
+            let build_result = self.executor.cargo_build(target).await?;
+            let build_ok = build_result.success;
+            let test_ok = build_ok && self.executor.cargo_test(target).await?;
 
             if !test_ok {
-                std::fs::copy(&backup, source_path)?;
+                self.executor.copy_file(&backup, source_path)?;
                 let rec = ModificationRecord {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     tier: 2,
@@ -465,6 +465,7 @@ impl CmpLoop {
             // ディレクトリ + ファイル作成
             let mod_dir = format!("modules/{}", mod_name);
             let src_dir = format!("{}/src", mod_dir);
+
             // Layer B ゲート: 新モジュールファイル書き込みを許可確認
             for write_path in [
                 format!("{}/Cargo.toml", mod_dir),
@@ -482,34 +483,24 @@ impl CmpLoop {
                 })?;
             }
 
-            std::fs::create_dir_all(&src_dir)
+            self.executor
+                .create_dir_all(&src_dir)
                 .with_context(|| format!("Failed to create {}", src_dir))?;
-            std::fs::write(format!("{}/Cargo.toml", mod_dir), &cargo_toml)?;
-            std::fs::write(format!("{}/src/main.rs", mod_dir), &main_rs)?;
+            self.executor
+                .write_file(&format!("{}/Cargo.toml", mod_dir), &cargo_toml)?;
+            self.executor
+                .write_file(&format!("{}/src/main.rs", mod_dir), &main_rs)?;
 
             // build + test
-            let build_out = tokio::process::Command::new("cargo")
-                .args(["build", "-p", &mod_name])
-                .output()
-                .await?;
-            let build_ok = build_out.status.success();
-            let build_error = if build_ok {
-                None
-            } else {
-                Some(String::from_utf8_lossy(&build_out.stderr).to_string())
-            };
+            let build_out = self.executor.cargo_build(&mod_name).await?;
+            let build_ok = build_out.success;
+            let build_error = build_out.stderr;
 
-            let test_ok = build_ok
-                && tokio::process::Command::new("cargo")
-                    .args(["test", "-p", &mod_name])
-                    .output()
-                    .await?
-                    .status
-                    .success();
+            let test_ok = build_ok && self.executor.cargo_test(&mod_name).await?;
 
             if !test_ok {
                 // 失敗: ディレクトリごと削除
-                let _ = std::fs::remove_dir_all(&mod_dir);
+                let _ = self.executor.remove_dir_all(&mod_dir);
                 let rec = ModificationRecord {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     tier: 2,
@@ -745,4 +736,255 @@ fn strip_code_fence(s: &str) -> String {
     }
 
     s.to_string()
+}
+
+// =============================================================================
+// Layer 2: Tier 1 修復ループの模擬テスト
+//
+// FakeExecutor で cargo/fs/hot_swap を差し替え、実プロセス・実 cargo 不使用で
+// maybe_repair の条件分岐 (Adopted / Rejected / BelowThreshold) を検証する。
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+
+    // --- Fake AI ---
+
+    struct FakeAi {
+        response: String,
+    }
+
+    #[async_trait]
+    impl AiBackend for FakeAi {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            Ok(self.response.clone())
+        }
+    }
+
+    // --- Fake Executor ---
+
+    struct FakeExecutor {
+        build_ok: bool,
+        test_ok: bool,
+        source: String,
+        /// 書き込まれた (path, content) のリスト
+        writes: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Executor for FakeExecutor {
+        fn read_file(&self, _path: &str) -> Result<String> {
+            Ok(self.source.clone())
+        }
+        fn write_file(&self, path: &str, content: &str) -> Result<()> {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((path.to_string(), content.to_string()));
+            Ok(())
+        }
+        fn copy_file(&self, _src: &str, _dst: &str) -> Result<()> {
+            Ok(())
+        }
+        fn create_dir_all(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+        fn remove_dir_all(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn cargo_build(&self, _pkg: &str) -> Result<crate::executor::BuildResult> {
+            Ok(crate::executor::BuildResult {
+                success: self.build_ok,
+                stderr: None,
+            })
+        }
+        async fn cargo_test(&self, _pkg: &str) -> Result<bool> {
+            Ok(self.test_ok)
+        }
+        async fn hot_swap(&self, _swapper: &HotSwapper, mut old: Child) -> Result<Child> {
+            let _ = old.kill().await;
+            let child = tokio::process::Command::new("sleep")
+                .arg("9999")
+                .spawn()
+                .expect("sleep must exist");
+            Ok(child)
+        }
+    }
+
+    fn fake_swapper() -> HotSwapper {
+        HotSwapper::new("test_module", "/dev/null", "/tmp/fake_test_cmp.sock")
+    }
+
+    async fn dummy_child() -> Child {
+        tokio::process::Command::new("sleep")
+            .arg("9999")
+            .spawn()
+            .expect("sleep must exist on this platform")
+    }
+
+    fn make_metadata() -> MetadataStore {
+        MetadataStore::open(":memory:").unwrap()
+    }
+
+    const FAKE_SRC: &str = "// # CMP Module Charter\n// What: テスト用モジュール\nfn main() {}\n";
+
+    // tier1_trigger は env から読む。テスト中は環境変数を設定しないので デフォルト 3 になる。
+    // error_count >= 3 → Tier 1 発動。
+
+    #[tokio::test]
+    async fn tier1_adopted_when_build_and_test_pass() {
+        let writes = Arc::new(Mutex::new(vec![]));
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(FakeAi {
+                response: "fn repaired() {}".to_string(),
+            }),
+            Box::new(FakeExecutor {
+                build_ok: true,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                writes: Arc::clone(&writes),
+            }),
+        );
+        let metadata = make_metadata();
+        let old_child = dummy_child().await;
+
+        let (outcome, mut new_child) = cmp
+            .maybe_repair(RepairContext {
+                error_code: "PARSE_ERROR",
+                error_count: 99,
+                module_name: "normalizer",
+                module_source_path: "/fake/src/main.rs",
+                hot_swapper: &fake_swapper(),
+                old_child,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        let _ = new_child.kill().await;
+        assert!(
+            matches!(outcome, RepairOutcome::Adopted),
+            "build+test pass → Adopted"
+        );
+        // AI の提案コードが書き込まれた
+        let w = writes.lock().unwrap();
+        assert!(
+            w.iter().any(|(_, c)| c == "fn repaired() {}"),
+            "repair code should be written; got: {:?}",
+            w
+        );
+    }
+
+    #[tokio::test]
+    async fn tier1_rejected_when_build_fails() {
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(FakeAi {
+                response: "broken".to_string(),
+            }),
+            Box::new(FakeExecutor {
+                build_ok: false,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                writes: Arc::new(Mutex::new(vec![])),
+            }),
+        );
+        let metadata = make_metadata();
+        let old_child = dummy_child().await;
+
+        let (outcome, mut returned_child) = cmp
+            .maybe_repair(RepairContext {
+                error_code: "BUILD_ERROR",
+                error_count: 5,
+                module_name: "tokenizer",
+                module_source_path: "/fake/src/main.rs",
+                hot_swapper: &fake_swapper(),
+                old_child,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        let _ = returned_child.kill().await;
+        assert!(
+            matches!(outcome, RepairOutcome::Rejected { .. }),
+            "build fail → Rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier1_rejected_when_test_fails() {
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(FakeAi {
+                response: "fn ok() {}".to_string(),
+            }),
+            Box::new(FakeExecutor {
+                build_ok: true,
+                test_ok: false,
+                source: FAKE_SRC.to_string(),
+                writes: Arc::new(Mutex::new(vec![])),
+            }),
+        );
+        let metadata = make_metadata();
+        let old_child = dummy_child().await;
+
+        let (outcome, mut returned_child) = cmp
+            .maybe_repair(RepairContext {
+                error_code: "PARSE_ERROR",
+                error_count: 3,
+                module_name: "parser",
+                module_source_path: "/fake/src/main.rs",
+                hot_swapper: &fake_swapper(),
+                old_child,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        let _ = returned_child.kill().await;
+        assert!(
+            matches!(outcome, RepairOutcome::Rejected { .. }),
+            "test fail → Rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn tier1_below_threshold_returns_old_child() {
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(FakeAi {
+                response: String::new(),
+            }),
+            Box::new(FakeExecutor {
+                build_ok: true,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                writes: Arc::new(Mutex::new(vec![])),
+            }),
+        );
+        let metadata = make_metadata();
+        let old_child = dummy_child().await;
+
+        // tier1_trigger = 3 (デフォルト), count = 2 → BelowThreshold
+        let (outcome, mut returned_child) = cmp
+            .maybe_repair(RepairContext {
+                error_code: "PARSE_ERROR",
+                error_count: 2,
+                module_name: "normalizer",
+                module_source_path: "/fake/src/main.rs",
+                hot_swapper: &fake_swapper(),
+                old_child,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        let _ = returned_child.kill().await;
+        assert!(
+            matches!(outcome, RepairOutcome::BelowThreshold),
+            "count < threshold → BelowThreshold"
+        );
+    }
 }

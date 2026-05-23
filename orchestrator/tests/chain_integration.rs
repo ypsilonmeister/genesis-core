@@ -95,8 +95,7 @@ struct TestProcesses {
 impl TestProcesses {
     async fn spawn(label: &str) -> anyhow::Result<(Self, Vec<String>)> {
         let id = next_test_id();
-        let sock_dir =
-            PathBuf::from(format!("/tmp/genesis-test-chain-{}-{}", label, id));
+        let sock_dir = PathBuf::from(format!("/tmp/genesis-test-chain-{}-{}", label, id));
         std::fs::create_dir_all(&sock_dir)?;
 
         let modules = ["normalizer", "tokenizer", "parser", "evaluator"];
@@ -174,7 +173,9 @@ async fn chain_basic_arithmetic_with_precedence() {
 #[tokio::test]
 async fn chain_parentheses_override_precedence() {
     let (_procs, socks) = TestProcesses::spawn("paren").await.unwrap();
-    let result = run_chain(&socks, "(2 + 3) * 4").await.expect("chain failed");
+    let result = run_chain(&socks, "(2 + 3) * 4")
+        .await
+        .expect("chain failed");
     assert_eq!(result, "20", "(2 + 3) * 4 should be 20");
 }
 
@@ -197,6 +198,8 @@ async fn chain_division_by_zero_propagates_error() {
 async fn chain_whitespace_normalization() {
     let (_procs, socks) = TestProcesses::spawn("ws").await.unwrap();
     // 余分な空白は normalizer で除去されるべき
-    let result = run_chain(&socks, "  3  +  5  ").await.expect("chain failed");
+    let result = run_chain(&socks, "  3  +  5  ")
+        .await
+        .expect("chain failed");
     assert_eq!(result, "8");
 }
