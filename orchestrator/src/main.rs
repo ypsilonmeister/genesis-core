@@ -12,8 +12,6 @@
 //   - メタデータストアへの書き込み
 //   - 自己検証ループ (CMP §5) の実行
 //   - Tier 3 提案時の人間への通知
-//
-// このファイルは Week 1 のスケルトン。各モジュールへ拡張していく。
 // =============================================================================
 
 mod ai_backend;
@@ -26,18 +24,23 @@ mod ipc;
 mod metadata;
 mod process;
 
-use anyhow::Result;
-use tracing::{info, error};
+use std::collections::HashMap;
 use std::path::Path;
-use uuid::Uuid;
+
+use anyhow::Result;
 use chrono::Utc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::ai_backend::{build_claude_backend, build_gemini_backend};
 use crate::attacker::Attacker;
 use crate::chain::ChainConfig;
-use crate::cmp_loop::CmpLoop;
+use crate::cmp_loop::{CmpLoop, RepairContext, RepairOutcome};
+use crate::hot_swap::HotSwapper;
+use crate::ipc::{call_module, ModuleRequest};
+use crate::metadata::MetadataStore;
 use crate::process::ModuleProcess;
-use crate::ipc::{ModuleRequest, call_module};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -47,7 +50,7 @@ async fn main() -> Result<()> {
     // 1. AI バックエンドを初期化
     let claude = build_claude_backend()?;
     let gemini = build_gemini_backend()?;
-    let _cmp_loop = CmpLoop::new(claude);
+    let cmp = CmpLoop::new(claude);
     let _attacker = Attacker::new(gemini);
     info!(
         claude_backend = %std::env::var("CLAUDE_BACKEND").unwrap_or_else(|_| "cli".to_string()),
@@ -55,77 +58,145 @@ async fn main() -> Result<()> {
         "AI backends initialized"
     );
 
-    // 2. chain.toml を読み込む
+    // 2. SQLite メタデータストアを開く
+    let metadata = MetadataStore::open("metadata.db")?;
+    info!("metadata.db opened");
+
+    // 3. chain.toml を読み込む
     let chain_path = Path::new("chain.toml");
     let config = ChainConfig::load(chain_path)?;
-    info!("Loaded chain configuration with {} modules", config.modules.len());
+    info!("chain config loaded: {} modules", config.modules.len());
 
-    // 3. modules/*/ の各バイナリをサブプロセスとして起動
-    let mut processes = Vec::new();
+    // 4. 各モジュールをサブプロセスとして起動
+    let mut processes: Vec<(crate::chain::ModuleSpec, ModuleProcess)> = Vec::new();
     for m in &config.modules {
-        info!("Spawning module: {}", m.name);
+        info!("spawning module: {}", m.name);
         let proc = ModuleProcess::spawn(&m.name, &m.binary, &m.socket).await?;
-        processes.push(proc);
+        processes.push((m.clone(), proc));
     }
-
-    // モジュールの起動待ち (実際はヘルスチェックが必要だが、Week 1 なので 1秒待つ)
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-    // 3. UDS を使って順番にルーティング
-    let input = "3 + 5 * 2";
-    info!("Input: {:?}", input);
+    // 5. エラーカウンタ (error_code → 発生回数)
+    let mut error_counts: HashMap<String, u32> = HashMap::new();
+    let tier1_trigger = cmp.tier1_trigger;
 
-    let mut current_input = input.to_string();
-    let request_id = Uuid::new_v4().to_string();
+    // 6. stdin から入力を 1 行ずつ受け取ってチェーンに流すメインループ
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
 
-    for m in &config.modules {
-        info!("Calling module: {}", m.name);
-        let request = ModuleRequest {
-            request_id: request_id.clone(),
-            input: current_input.clone(),
-            timestamp: Utc::now(),
-        };
+    info!("ready — send expressions via stdin (Ctrl+D to quit)");
 
-        match call_module(&m.socket, &request).await {
-            Ok(response) => {
-                if let Some(err) = response.error {
-                    error!("Module {} returned error: {:?} ({})", m.name, err.code, err.message);
-                    return Ok(());
+    while let Some(line) = reader.next_line().await? {
+        let input = line.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+
+        let request_id = Uuid::new_v4().to_string();
+        let mut current = input.clone();
+        let mut chain_error: Option<(String, String)> = None; // (module_name, error_code)
+
+        // チェーンを順番に呼ぶ
+        'chain: for (m, _proc) in &processes {
+            let req = ModuleRequest {
+                request_id: request_id.clone(),
+                input: current.clone(),
+                timestamp: Utc::now(),
+            };
+
+            match call_module(&m.socket, &req).await {
+                Ok(resp) => {
+                    if let Some(err) = resp.error {
+                        warn!(
+                            module = %m.name,
+                            code = ?err.code,
+                            msg = %err.message,
+                            "module error"
+                        );
+                        chain_error = Some((m.name.clone(), format!("{:?}", err.code)));
+                        break 'chain;
+                    }
+                    if let Some(out) = resp.output {
+                        current = out;
+                    }
                 }
-                if let Some(output) = response.output {
-                    info!("Module {} output: {:?}", m.name, output);
-                    current_input = output;
-                } else {
-                    error!("Module {} returned no output and no error", m.name);
-                    return Ok(());
+                Err(e) => {
+                    error!(module = %m.name, err = %e, "IPC failure");
+                    chain_error = Some((m.name.clone(), "MODULE_CRASH".to_string()));
+                    break 'chain;
                 }
             }
-            Err(e) => {
-                error!("Failed to call module {}: {}", m.name, e);
-                return Ok(());
+        }
+
+        if let Some((module_name, error_code)) = chain_error {
+            // エラーカウントを更新
+            let count = error_counts.entry(error_code.clone()).or_insert(0);
+            *count += 1;
+            info!(
+                input = %input,
+                module = %module_name,
+                error_code = %error_code,
+                count = *count,
+                threshold = tier1_trigger,
+                "error recorded"
+            );
+
+            // Tier 1 トリガ判定
+            if *count >= tier1_trigger {
+                info!(
+                    error_code = %error_code,
+                    "Tier 1 triggered"
+                );
+
+                // 対象モジュールのインデックスを探す
+                if let Some(idx) = processes.iter().position(|(m, _)| m.name == module_name) {
+                    let (m_cfg, proc) = processes.remove(idx);
+                    let source_path = format!("modules/{}/src/main.rs", m_cfg.name);
+                    let swapper = HotSwapper::new(&m_cfg.name, &m_cfg.binary, &m_cfg.socket);
+
+                    let (outcome, new_child) = cmp.maybe_repair(RepairContext {
+                        error_code: &error_code,
+                        error_count: *count,
+                        module_name: &m_cfg.name,
+                        module_source_path: &source_path,
+                        hot_swapper: &swapper,
+                        old_child: proc.child,
+                        metadata: &metadata,
+                    }).await?;
+
+                    let new_proc = ModuleProcess { name: m_cfg.name.clone(), child: new_child };
+                    processes.insert(idx, (m_cfg, new_proc));
+
+                    match outcome {
+                        RepairOutcome::Adopted => {
+                            info!(error_code = %error_code, "Tier 1: repair adopted, resetting counter");
+                            error_counts.remove(&error_code);
+                        }
+                        RepairOutcome::Rejected { reason } => {
+                            warn!(error_code = %error_code, reason = %reason, "Tier 1: repair rejected");
+                        }
+                        RepairOutcome::BelowThreshold => {}
+                    }
+                }
             }
+        } else {
+            println!("{} => {}", input, current);
         }
     }
 
-    // 4. 結果の確認
-    info!("Final Result: {}", current_input);
-    assert_eq!(current_input, "13");
-    info!("End-to-end calculation successful!");
-
-    // 全プロセスを終了させる (実際は graceful shutdown が必要)
-    for mut p in processes {
+    // 全プロセスを終了
+    for (_m, mut p) in processes {
         let _ = p.child.kill().await;
     }
 
+    info!("orchestrator shutdown complete");
     Ok(())
 }
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,orchestrator=debug"));
-
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
