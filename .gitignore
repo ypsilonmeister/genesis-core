@@ -1,0 +1,36 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# 環境変数
+.env
+.env.local
+.env.*.local
+
+# メタデータ (追記専用、git 管理外)
+/metadata.db
+/metadata.db-journal
+/metadata.db-wal
+/metadata.db-shm
+
+# 旧バイナリ退避場所
+/archive/*
+!/archive/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 一時ファイル
+/tmp/
+*.tmp
+*.log
+.claude/settings.local.json

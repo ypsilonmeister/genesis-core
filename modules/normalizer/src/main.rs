@@ -1,0 +1,156 @@
+// =============================================================================
+// # CMP Module Charter
+//
+// What:
+//   入力文字列を正規化して後続モジュールに渡す(空白除去のみ)。
+//
+// Invariants:
+//   - 入力文字列を破壊的に変更しない(元の入力はログに残す)
+//   - 空文字列を受け取った場合はエラーを返す
+//
+// Boundaries:
+//   - 依存先: なし
+//   - 被依存先: tokenizer
+//
+// Extensible:
+//   - 正規化ルールの追加 (全角→半角変換、不可視文字除去、etc.)
+//
+// Why:
+//   後続モジュールが純粋な解析に集中できるよう、表層的なノイズを除去する。
+//
+// Tier 1 で AI が改変するときは、上記 Invariants と Boundaries を絶対に
+// 破らないこと。What の範囲を超える変更は Tier 2 として扱う。
+// =============================================================================
+
+// v1 実装範囲:
+//   連続空白を単一空白に圧縮、前後空白をトリム。それ以外は素通し。
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
+use std::env;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleRequest {
+    pub request_id: String,
+    pub input: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleResponse {
+    pub request_id: String,
+    pub output: Option<String>,
+    pub error: Option<ModuleError>,
+    pub processing_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleError {
+    pub code: String,
+    pub message: String,
+    pub input_position: Option<usize>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing();
+    tracing::info!("normalizer booting (v1)");
+
+    let socket_path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/genesis-core/normalizer.sock".to_string());
+
+    // 以前のソケットファイルを削除
+    let _ = std::fs::remove_file(&socket_path);
+    // ディレクトリ作成
+    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let listener = UnixListener::bind(&socket_path)?;
+    tracing::info!("Listening on {}", socket_path);
+
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let (reader, mut writer) = stream.split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+
+            if let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 { return; }
+                let start = std::time::Instant::now();
+                let request: ModuleRequest = match serde_json::from_str(&line) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        tracing::error!("Failed to parse request: {}", e);
+                        return;
+                    }
+                };
+
+                let (output, error) = match normalize(&request.input) {
+                    Ok(out) => (Some(out), None),
+                    Err(e) => (None, Some(ModuleError {
+                        code: "SYNTAX_ERROR".to_string(), // normalizer doesn't have specific error codes in spec yet
+                        message: e,
+                        input_position: None,
+                    })),
+                };
+
+                let response = ModuleResponse {
+                    request_id: request.request_id,
+                    output,
+                    error,
+                    processing_ms: start.elapsed().as_millis() as u64,
+                };
+
+                if let Ok(payload) = serde_json::to_vec(&response) {
+                    let mut payload = payload;
+                    payload.push(b'\n');
+                    let _ = writer.write_all(&payload).await;
+                }
+            }
+        });
+    }
+}
+
+/// 連続空白を単一空白に圧縮し、前後空白をトリムする。
+/// 元の入力は破壊しない(参照を借りるだけ)。
+/// 空文字列の場合はエラーを返す。
+pub fn normalize(input: &str) -> Result<String, String> {
+    if input.trim().is_empty() {
+        return Err("Empty input".to_string());
+    }
+    Ok(input.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,normalizer=debug"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapses_whitespace() {
+        assert_eq!(normalize("3  +\n5 *  2").unwrap(), "3 + 5 * 2");
+    }
+
+    #[test]
+    fn trims_edges() {
+        assert_eq!(normalize("  3 + 5  ").unwrap(), "3 + 5");
+    }
+
+    #[test]
+    fn empty_input_returns_error() {
+        // Charter: 空文字列を受け取った場合はエラーを返す
+        assert!(normalize("").is_err());
+        assert!(normalize("   ").is_err());
+    }
+}
