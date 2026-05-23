@@ -1,18 +1,57 @@
+// Week 3 で使われるスキャフォールディング。未使用の dead_code を許容する。
+#![allow(dead_code)]
+
 // =============================================================================
-// attacker.rs — 攻撃 AI (Gemini) の呼び出し
+// attacker.rs — 攻撃 AI 呼び出し
 //
-// Lying Calculator §4 に従う:
-//   - Phase A (文字レベル) → D (構造レベル) を段階解放
-//   - 攻撃間隔は 30秒〜3分のランダム
-//   - 1 回 1〜5 個の入力を生成
-//   - 攻撃多様性スコアを計測し、過適合時はプロンプトを補強 (§4.5)
+// Lying Calculator §4 に従って Gemini に攻撃入力を生成させる。
+// Phase A (文字レベル) → Phase D (構造レベル) を段階的に解放。
 //
 // charter/system.md §2 HI-4: 攻撃 AI は modules/, orchestrator/, charter/ の
 // ソースコードに触れない。Layer B が AttackAi アクターを拒絶する。
+//
+// 現時点 (Week 2) はスタブ。Week 3 で本格実装:
+//   - 攻撃プロンプトの構築
+//   - gemini_backend.complete() で攻撃入力を取得
+//   - JSON 配列としてパース
+//   - チェーンに流して結果を attacks テーブルに記録
+//   - diversity_score の計算と過適合検出 (§4.5)
 // =============================================================================
 
-// TODO(Week 3):
-//   - reqwest::Client で Gemini API を叩く
-//   - 攻撃 Phase を SQLite から読み出す (現在の解放レベル)
-//   - 生成された入力を chain に流し、結果を attacks テーブルに転写
-//   - diversity_score 計算 (直近 20 攻撃の文字レベル差異)
+use anyhow::Result;
+use tracing::debug;
+
+use crate::ai_backend::AiBackend;
+
+pub struct Attacker {
+    gemini: Box<dyn AiBackend>,
+    pub phase: String,
+}
+
+impl Attacker {
+    pub fn new(gemini: Box<dyn AiBackend>) -> Self {
+        let phase = std::env::var("ATTACK_PHASE").unwrap_or_else(|_| "A".to_string());
+        Self { gemini, phase }
+    }
+
+    // 攻撃入力を生成する。
+    // success_samples: 直近の成功入力サンプル
+    // recent_errors:   直近のエラーログ
+    // 戻り値: 攻撃入力の文字列リスト
+    // TODO(Week 3): 本格実装
+    pub async fn generate_attacks(
+        &self,
+        success_samples: &[String],
+        recent_errors: &[String],
+    ) -> Result<Vec<String>> {
+        debug!(phase = %self.phase, "Attacker::generate_attacks (stub)");
+
+        // Week 3 実装ヒント:
+        // let prompt = build_attack_prompt(&self.phase, success_samples, recent_errors);
+        // let response = self.gemini.complete(&prompt).await?;
+        // serde_json::from_str::<Vec<String>>(&response).context(...)
+
+        let _ = (success_samples, recent_errors, &self.gemini);
+        Ok(vec![])
+    }
+}

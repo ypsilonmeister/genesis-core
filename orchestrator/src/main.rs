@@ -16,6 +16,7 @@
 // このファイルは Week 1 のスケルトン。各モジュールへ拡張していく。
 // =============================================================================
 
+mod ai_backend;
 mod attacker;
 mod charter_runtime;
 mod chain;
@@ -31,21 +32,35 @@ use std::path::Path;
 use uuid::Uuid;
 use chrono::Utc;
 
+use crate::ai_backend::{build_claude_backend, build_gemini_backend};
+use crate::attacker::Attacker;
 use crate::chain::ChainConfig;
+use crate::cmp_loop::CmpLoop;
 use crate::process::ModuleProcess;
 use crate::ipc::{ModuleRequest, call_module};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    info!("genesis-core orchestrator booting (Week 1)");
+    info!("genesis-core orchestrator booting");
 
-    // 1. chain.toml を読み込む
+    // 1. AI バックエンドを初期化
+    let claude = build_claude_backend()?;
+    let gemini = build_gemini_backend()?;
+    let _cmp_loop = CmpLoop::new(claude);
+    let _attacker = Attacker::new(gemini);
+    info!(
+        claude_backend = %std::env::var("CLAUDE_BACKEND").unwrap_or_else(|_| "cli".to_string()),
+        gemini_backend = %std::env::var("GEMINI_BACKEND").unwrap_or_else(|_| "cli".to_string()),
+        "AI backends initialized"
+    );
+
+    // 2. chain.toml を読み込む
     let chain_path = Path::new("chain.toml");
     let config = ChainConfig::load(chain_path)?;
     info!("Loaded chain configuration with {} modules", config.modules.len());
 
-    // 2. modules/*/ の各バイナリをサブプロセスとして起動
+    // 3. modules/*/ の各バイナリをサブプロセスとして起動
     let mut processes = Vec::new();
     for m in &config.modules {
         info!("Spawning module: {}", m.name);

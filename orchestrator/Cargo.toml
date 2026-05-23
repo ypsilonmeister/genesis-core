@@ -25,3 +25,4 @@ chrono = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true }
 toml = { workspace = true }
+async-trait = { workspace = true }

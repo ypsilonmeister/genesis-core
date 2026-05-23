@@ -2,6 +2,7 @@ use tokio::process::{Child, Command};
 use std::process::Stdio;
 
 pub struct ModuleProcess {
+    #[allow(dead_code)]
     pub name: String,
     pub child: Child,
 }

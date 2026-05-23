@@ -10,9 +10,11 @@
 
 // Layer B のソースは ../charter/enforcement.rs に置かれている。
 // 物理的に同じファイルを参照することで、二重実装による乖離を防ぐ。
+#[allow(clippy::trim_split_whitespace)]
 #[path = "../../charter/enforcement.rs"]
 mod enforcement;
 
+#[allow(unused_imports)]
 pub use enforcement::*;
 
 // この時点で `enforce_hard_invariants`, `CharterViolation`, `Action`, `Actor`,

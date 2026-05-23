@@ -49,6 +49,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// CMP の Tier 区分。Tier 1 = モジュール内修復、Tier 2 = 新モジュール追加。
+    #[allow(dead_code)]
     pub fn tier(&self) -> u8 {
         match self {
             ErrorCode::UnknownPattern => 2,

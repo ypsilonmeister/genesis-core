@@ -121,7 +121,7 @@ Phase 1 では Unix Domain Socket を使う。Windows ローカル開発時は W
 
 ## 開発フェーズの現在地
 
-- [ ] Week 1: 4 モジュールが UDS で繋がり `"3 + 5 * 2"` → `13` が通る
+- [x] Week 1: 4 モジュールが UDS で繋がり `"3 + 5 * 2"` → `13` が通る
 - [ ] Week 2: Tier 1 修復ループ (Claude API 呼び出し + hot swap)
 - [ ] Week 3: Tier 2 ループ + 攻撃 AI Phase A 解放
 - [ ] Week 4: 把握テスト + 30 日連続運転開始
