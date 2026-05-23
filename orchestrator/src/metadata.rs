@@ -14,7 +14,7 @@
 // =============================================================================
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 use crate::charter_runtime::{enforce_hard_invariants, Action, Actor};
 
@@ -32,7 +32,9 @@ impl MetadataStore {
     }
 
     fn init_schema(&self) -> Result<()> {
-        self.conn.execute_batch("
+        self.conn
+            .execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS modifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -82,28 +84,76 @@ impl MetadataStore {
                 match_result TEXT NOT NULL,
                 split_candidate INTEGER NOT NULL
             );
-        ").context("Failed to initialize schema")?;
+        ",
+            )
+            .context("Failed to initialize schema")?;
         Ok(())
     }
 
     pub fn insert_modification(&self, rec: &ModificationRecord) -> Result<i64> {
-        enforce_hard_invariants(Actor::RepairAi, &Action::DbOperation { sql: "INSERT".to_string() })
-            .map_err(|e| anyhow::anyhow!("Charter violation: {:?}", e))?;
+        enforce_hard_invariants(
+            Actor::RepairAi,
+            &Action::DbOperation {
+                sql: "INSERT".to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Charter violation: {:?}", e))?;
 
-        self.conn.execute(
-            "INSERT INTO modifications (
+        self.conn
+            .execute(
+                "INSERT INTO modifications (
                 timestamp, tier, module_name, trigger_type, trigger_count,
                 prompt_full, model_name, generated_code,
                 build_result, build_error, test_result,
                 decision, rejection_reason, adopted_at
             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-            params![
-                rec.timestamp, rec.tier, rec.module_name, rec.trigger_type, rec.trigger_count,
-                rec.prompt_full, rec.model_name, rec.generated_code,
-                rec.build_result, rec.build_error, rec.test_result,
-                rec.decision, rec.rejection_reason, rec.adopted_at,
-            ],
-        ).context("Failed to insert modification")?;
+                params![
+                    rec.timestamp,
+                    rec.tier,
+                    rec.module_name,
+                    rec.trigger_type,
+                    rec.trigger_count,
+                    rec.prompt_full,
+                    rec.model_name,
+                    rec.generated_code,
+                    rec.build_result,
+                    rec.build_error,
+                    rec.test_result,
+                    rec.decision,
+                    rec.rejection_reason,
+                    rec.adopted_at,
+                ],
+            )
+            .context("Failed to insert modification")?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn insert_attack(
+        &self,
+        attacker_model: &str,
+        inputs: &[String],
+        phase: &str,
+        diversity_score: Option<f64>,
+        results: &serde_json::Value,
+    ) -> Result<i64> {
+        enforce_hard_invariants(
+            Actor::RepairAi,
+            &Action::DbOperation {
+                sql: "INSERT".to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Charter violation: {:?}", e))?;
+
+        let ts = chrono::Utc::now().to_rfc3339();
+        let inputs_json = serde_json::to_string(inputs).context("Failed to serialize inputs")?;
+        let results_json = results.to_string();
+
+        self.conn.execute(
+            "INSERT INTO attacks (timestamp, attacker_model, inputs, phase, diversity_score, results)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![ts, attacker_model, inputs_json, phase, diversity_score, results_json],
+        ).context("Failed to insert attack")?;
 
         Ok(self.conn.last_insert_rowid())
     }
@@ -117,8 +167,13 @@ impl MetadataStore {
         charter: &str,
         modification_id: Option<i64>,
     ) -> Result<()> {
-        enforce_hard_invariants(Actor::RepairAi, &Action::DbOperation { sql: "INSERT".to_string() })
-            .map_err(|e| anyhow::anyhow!("Charter violation: {:?}", e))?;
+        enforce_hard_invariants(
+            Actor::RepairAi,
+            &Action::DbOperation {
+                sql: "INSERT".to_string(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Charter violation: {:?}", e))?;
 
         let ts = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
@@ -140,10 +195,10 @@ pub struct ModificationRecord {
     pub prompt_full: String,
     pub model_name: String,
     pub generated_code: Option<String>,
-    pub build_result: String,      // "success" | "failure"
+    pub build_result: String, // "success" | "failure"
     pub build_error: Option<String>,
     pub test_result: Option<String>, // "pass" | "fail"
-    pub decision: String,           // "adopted" | "rejected"
+    pub decision: String,            // "adopted" | "rejected"
     pub rejection_reason: Option<String>,
     pub adopted_at: Option<String>,
 }
