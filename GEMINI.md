@@ -118,6 +118,6 @@ Gemini CLI の `@file.md` syntax を積極的に使う:
 - [x] Week 1: Gemini はまだ実行されない (orchestrator 骨格通電が先)
 - [x] Week 2: Gemini API キーの動作確認 (`tests/gemini_smoke.rs`)
 - [x] Week 3: 攻撃 AI Phase A 解放、初回攻撃ログ記録
-- [ ] Week 4: diversity score の運用開始
+- [x] Week 4: diversity score の運用開始 + 攻撃 Phase B/C/D 解放
 
 **Week 3 までは Gemini の出番なし。** その間 Gemini CLI は本リポジトリで主にコードレビュアー役を務める。

@@ -124,6 +124,6 @@ Phase 1 では Unix Domain Socket を使う。Windows ローカル開発時は W
 - [x] Week 1: 4 モジュールが UDS で繋がり `"3 + 5 * 2"` → `13` が通る
 - [x] Week 2: Tier 1 修復ループ (Claude API 呼び出し + hot swap)
 - [x] Week 3: Tier 2 ループ + 攻撃 AI Phase A 解放
-- [ ] Week 4: 把握テスト + 30 日連続運転開始
+- [x] Week 4: 把握テスト + 30 日連続運転開始
 
 **最初のコミットで動かすべきもの:** `"3 + 5 * 2"` → `13` が end-to-end で通ること。それだけ。攻撃 AI も CMP ループも後回し。
