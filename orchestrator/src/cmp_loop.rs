@@ -26,6 +26,7 @@ use tokio::process::Child;
 use tracing::{info, warn};
 
 use crate::ai_backend::AiBackend;
+use crate::charter_runtime::{enforce_hard_invariants, Action, Actor};
 use crate::hot_swap::HotSwapper;
 use crate::metadata::{MetadataStore, ModificationRecord};
 
@@ -125,6 +126,16 @@ impl CmpLoop {
 
         // markdown コードブロックがあれば剥がす
         let generated_code = strip_code_fence(&response);
+
+        // Layer B ゲート: RepairAi によるモジュールソース書き込みを許可確認
+        enforce_hard_invariants(
+            Actor::RepairAi,
+            &Action::FileWrite {
+                path: std::path::PathBuf::from(module_source_path),
+                size_bytes: generated_code.len(),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("Charter violation before Tier1 write: {:?}", e))?;
 
         // バックアップ → ファイル書き込み
         let backup_path = format!("{}.bak", module_source_path);
@@ -335,6 +346,16 @@ impl CmpLoop {
             let repair_code = self.claude.complete(&repair_prompt).await?;
             let new_code = strip_code_fence(&repair_code);
 
+            // Layer B ゲート: Tier 2 extend での書き込みを許可確認
+            enforce_hard_invariants(
+                Actor::RepairAi,
+                &Action::FileWrite {
+                    path: std::path::PathBuf::from(source_path.as_str()),
+                    size_bytes: new_code.len(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Charter violation before Tier2 extend write: {:?}", e))?;
+
             // バックアップ → 書き込み → build → test
             let backup = format!("{}.bak", source_path);
             std::fs::copy(source_path, &backup)?;
@@ -444,6 +465,23 @@ impl CmpLoop {
             // ディレクトリ + ファイル作成
             let mod_dir = format!("modules/{}", mod_name);
             let src_dir = format!("{}/src", mod_dir);
+            // Layer B ゲート: 新モジュールファイル書き込みを許可確認
+            for write_path in [
+                format!("{}/Cargo.toml", mod_dir),
+                format!("{}/src/main.rs", mod_dir),
+            ] {
+                enforce_hard_invariants(
+                    Actor::RepairAi,
+                    &Action::FileWrite {
+                        path: std::path::PathBuf::from(&write_path),
+                        size_bytes: cargo_toml.len() + main_rs.len(),
+                    },
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("Charter violation before new module write: {:?}", e)
+                })?;
+            }
+
             std::fs::create_dir_all(&src_dir)
                 .with_context(|| format!("Failed to create {}", src_dir))?;
             std::fs::write(format!("{}/Cargo.toml", mod_dir), &cargo_toml)?;

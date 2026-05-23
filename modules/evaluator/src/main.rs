@@ -74,6 +74,14 @@ pub enum EvalError {
     Overflow(String),
 }
 
+fn check_overflow(v: f64) -> Result<f64, EvalError> {
+    if v.is_infinite() || v.is_nan() {
+        Err(EvalError::Overflow(format!("result is {}", v)))
+    } else {
+        Ok(v)
+    }
+}
+
 pub fn evaluate(expr: &Expr) -> Result<f64, EvalError> {
     match expr {
         Expr::Number(n) => Ok(*n),
@@ -81,14 +89,14 @@ pub fn evaluate(expr: &Expr) -> Result<f64, EvalError> {
             let lhs_val = evaluate(lhs)?;
             let rhs_val = evaluate(rhs)?;
             match op {
-                BinOp::Add => Ok(lhs_val + rhs_val),
-                BinOp::Sub => Ok(lhs_val - rhs_val),
-                BinOp::Mul => Ok(lhs_val * rhs_val),
+                BinOp::Add => check_overflow(lhs_val + rhs_val),
+                BinOp::Sub => check_overflow(lhs_val - rhs_val),
+                BinOp::Mul => check_overflow(lhs_val * rhs_val),
                 BinOp::Div => {
                     if rhs_val == 0.0 {
                         Err(EvalError::DivisionByZero)
                     } else {
-                        Ok(lhs_val / rhs_val)
+                        check_overflow(lhs_val / rhs_val)
                     }
                 }
             }
@@ -207,6 +215,19 @@ mod tests {
         assert!(matches!(
             evaluate(&expr).unwrap_err(),
             EvalError::DivisionByZero
+        ));
+    }
+
+    #[test]
+    fn rejects_overflow_on_multiply() {
+        let expr = Expr::BinOp {
+            op: BinOp::Mul,
+            lhs: Box::new(Expr::Number(f64::MAX)),
+            rhs: Box::new(Expr::Number(2.0)),
+        };
+        assert!(matches!(
+            evaluate(&expr).unwrap_err(),
+            EvalError::Overflow(_)
         ));
     }
 }

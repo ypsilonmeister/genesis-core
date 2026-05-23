@@ -149,11 +149,18 @@ async fn main() -> Result<()> {
     // 7. エラーカウンタ
     let mut error_counts: HashMap<String, u32> = HashMap::new();
     let mut unknown_pattern_examples: VecDeque<String> = VecDeque::new();
+    // モジュールごとの Tier 1 採用回数 (エスカレーション判定に使う)
+    let mut module_repair_counts: HashMap<String, u32> = HashMap::new();
     let tier1_trigger = cmp.tier1_trigger;
     let tier2_trigger: u32 = std::env::var("TIER2_TRIGGER_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    // 同一モジュールを N 回 Tier 1 修復しても再エラー → UNKNOWN_PATTERN にエスカレート
+    let tier1_max_repairs: u32 = std::env::var("TIER1_MAX_REPAIRS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
 
     info!("ready — send expressions via stdin (Ctrl+D to quit)");
 
@@ -237,50 +244,78 @@ async fn main() -> Result<()> {
 
                 // Tier 1 判定
                 if error_code != "UnknownPattern" && *count >= tier1_trigger {
-                    info!(error_code = %error_code, "Tier 1 triggered");
-                    if let Some(idx) = processes.iter().position(|(m, _)| m.name == module_name) {
-                        let (m_cfg, proc) = processes.remove(idx);
-                        let source_path = format!("modules/{}/src/main.rs", m_cfg.name);
-                        let swapper = HotSwapper::new(&m_cfg.name, &m_cfg.binary, &m_cfg.socket);
+                    // エスカレーション判定: 同一モジュールを N 回修復済みなら UNKNOWN_PATTERN に昇格
+                    let past_repairs = module_repair_counts.get(&module_name).copied().unwrap_or(0);
+                    if past_repairs >= tier1_max_repairs {
+                        info!(
+                            module = %module_name,
+                            past_repairs,
+                            "Tier 1 exhausted → escalating to UNKNOWN_PATTERN"
+                        );
+                        unknown_pattern_examples.push_back(input.clone());
+                        while unknown_pattern_examples.len() > 20 {
+                            unknown_pattern_examples.pop_front();
+                        }
+                        let up_count = error_counts
+                            .entry("UnknownPattern".to_string())
+                            .or_insert(0);
+                        *up_count += 1;
+                    } else {
+                        info!(error_code = %error_code, "Tier 1 triggered");
+                        if let Some(idx) = processes.iter().position(|(m, _)| m.name == module_name)
+                        {
+                            let (m_cfg, proc) = processes.remove(idx);
+                            let source_path = format!("modules/{}/src/main.rs", m_cfg.name);
+                            let swapper =
+                                HotSwapper::new(&m_cfg.name, &m_cfg.binary, &m_cfg.socket);
 
-                        let (outcome, new_child) = cmp
-                            .maybe_repair(RepairContext {
-                                error_code: &error_code,
-                                error_count: *count,
-                                module_name: &m_cfg.name,
-                                module_source_path: &source_path,
-                                hot_swapper: &swapper,
-                                old_child: proc.child,
-                                metadata: &metadata,
-                            })
-                            .await?;
+                            let (outcome, new_child) = cmp
+                                .maybe_repair(RepairContext {
+                                    error_code: &error_code,
+                                    error_count: *count,
+                                    module_name: &m_cfg.name,
+                                    module_source_path: &source_path,
+                                    hot_swapper: &swapper,
+                                    old_child: proc.child,
+                                    metadata: &metadata,
+                                })
+                                .await?;
 
-                        let mod_name_t1 = m_cfg.name.clone();
-                        let new_proc = ModuleProcess {
-                            name: m_cfg.name.clone(),
-                            child: new_child,
-                        };
-                        processes.insert(idx, (m_cfg, new_proc));
+                            let mod_name_t1 = m_cfg.name.clone();
+                            let new_proc = ModuleProcess {
+                                name: m_cfg.name.clone(),
+                                child: new_child,
+                            };
+                            processes.insert(idx, (m_cfg, new_proc));
 
-                        match outcome {
-                            RepairOutcome::Adopted => {
-                                info!(error_code = %error_code, "Tier 1: repair adopted");
-                                error_counts.remove(&error_code);
-                                // §5 把握テスト
-                                let sp = format!("modules/{}/src/main.rs", mod_name_t1);
-                                if let Ok(code) = std::fs::read_to_string(&sp) {
-                                    if let Err(e) = cmp
-                                        .run_comprehension_test(&mod_name_t1, &code, &metadata)
-                                        .await
-                                    {
-                                        warn!(err = %e, "comprehension test failed");
+                            match outcome {
+                                RepairOutcome::Adopted => {
+                                    info!(error_code = %error_code, "Tier 1: repair adopted");
+                                    error_counts.remove(&error_code);
+                                    // 採用回数をインクリメント (エスカレーション判定用)
+                                    *module_repair_counts
+                                        .entry(mod_name_t1.clone())
+                                        .or_insert(0) += 1;
+                                    // §5 把握テスト
+                                    let sp = format!("modules/{}/src/main.rs", mod_name_t1);
+                                    if let Ok(code) = std::fs::read_to_string(&sp) {
+                                        if let Err(e) = cmp
+                                            .run_comprehension_test(&mod_name_t1, &code, &metadata)
+                                            .await
+                                        {
+                                            warn!(err = %e, "comprehension test failed");
+                                        }
                                     }
                                 }
+                                RepairOutcome::Rejected { reason } => {
+                                    warn!(
+                                        error_code = %error_code,
+                                        reason = %reason,
+                                        "Tier 1: repair rejected"
+                                    );
+                                }
+                                RepairOutcome::BelowThreshold => {}
                             }
-                            RepairOutcome::Rejected { reason } => {
-                                warn!(error_code = %error_code, reason = %reason, "Tier 1: repair rejected");
-                            }
-                            RepairOutcome::BelowThreshold => {}
                         }
                     }
                 }
@@ -350,7 +385,9 @@ async fn main() -> Result<()> {
                             unknown_pattern_examples.clear();
 
                             // chain.toml を永続化
-                            let mut new_config = ChainConfig { modules: Vec::new() };
+                            let mut new_config = ChainConfig {
+                                modules: Vec::new(),
+                            };
                             for (m_spec, _) in &processes {
                                 new_config.modules.push(m_spec.clone());
                             }
