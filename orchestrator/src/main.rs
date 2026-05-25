@@ -314,6 +314,11 @@ async fn main() -> Result<()> {
                                         reason = %reason,
                                         "Tier 1: repair rejected"
                                     );
+                                    // Rejected でも試行回数としてカウントし、
+                                    // 閾値超えで UNKNOWN_PATTERN にエスカレーションする
+                                    *module_repair_counts
+                                        .entry(mod_name_t1.clone())
+                                        .or_insert(0) += 1;
                                 }
                                 RepairOutcome::BelowThreshold => {}
                             }

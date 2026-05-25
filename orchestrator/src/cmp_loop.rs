@@ -353,7 +353,7 @@ impl CmpLoop {
                 制約:\n\
                 - Module CharterのInvariantsを破らないこと\n\
                 - 修正範囲は最小限にすること\n\n\
-                出力: 修正後のRustコード全体をコードブロックなしで出力してください。"
+                出力: 修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。"
             );
 
             let repair_code = self.claude.complete(&repair_prompt).await?;
@@ -727,15 +727,17 @@ fn extract_charter(code: &str) -> String {
 fn strip_code_fence(s: &str) -> String {
     let s = s.trim();
 
-    // ```rust\n...\n``` または ```\n...\n```
-    if let Some(rest) = s.strip_prefix("```rust") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim().to_string();
-        }
-    }
-    if let Some(rest) = s.strip_prefix("```") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim().to_string();
+    // レスポンス中のどこにある ```rust / ``` ブロックでも抽出できるよう、
+    // 先頭一致ではなく最初の出現位置を探す。
+    // これにより日本語の説明文がコードブロックの前に付いていても正しく抽出できる。
+    for fence in ["```rust", "```"] {
+        if let Some(start) = s.find(fence) {
+            let after_open = &s[start + fence.len()..];
+            // フェンス直後の改行を読み飛ばす
+            let code_start = after_open.trim_start_matches('\n');
+            if let Some(end) = code_start.find("```") {
+                return code_start[..end].trim().to_string();
+            }
         }
     }
 
@@ -989,6 +991,466 @@ mod tests {
         assert!(
             matches!(outcome, RepairOutcome::BelowThreshold),
             "count < threshold → BelowThreshold"
+        );
+    }
+
+    // =========================================================================
+    // Layer 4: Tier 2 モックテスト
+    //
+    // SequencedAi (事前キューから順番に応答) + TrackingExecutor (Op 記録) で
+    // maybe_tier2 の条件分岐をすべて副作用なしに検証する。
+    // =========================================================================
+
+    use std::collections::VecDeque;
+
+    // --- Sequenced AI: 事前に積んだ応答を順番に返す ---
+
+    struct SequencedAi {
+        responses: Arc<Mutex<VecDeque<String>>>,
+    }
+
+    impl SequencedAi {
+        fn new(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into_iter().map(Into::into).collect())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AiBackend for SequencedAi {
+        async fn complete(&self, _prompt: &str) -> Result<String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("SequencedAi: no more responses queued"))
+        }
+    }
+
+    // --- Op: TrackingExecutor が記録する副作用の種別 ---
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Op {
+        WriteFile(String),
+        CopyFile(String, String),
+        CreateDirAll(String),
+        RemoveDirAll(String),
+        CargoBuild(String),
+        CargoTest(String),
+    }
+
+    // --- Tracking Executor: すべての副作用を Op として記録する ---
+
+    struct TrackingExecutor {
+        build_ok: bool,
+        test_ok: bool,
+        source: String,
+        ops: Arc<Mutex<Vec<Op>>>,
+    }
+
+    #[async_trait]
+    impl Executor for TrackingExecutor {
+        fn read_file(&self, _path: &str) -> Result<String> {
+            Ok(self.source.clone())
+        }
+        fn write_file(&self, path: &str, _content: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::WriteFile(path.to_string()));
+            Ok(())
+        }
+        fn copy_file(&self, src: &str, dst: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::CopyFile(src.to_string(), dst.to_string()));
+            Ok(())
+        }
+        fn create_dir_all(&self, path: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::CreateDirAll(path.to_string()));
+            Ok(())
+        }
+        fn remove_dir_all(&self, path: &str) -> Result<()> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::RemoveDirAll(path.to_string()));
+            Ok(())
+        }
+        async fn cargo_build(&self, pkg: &str) -> Result<crate::executor::BuildResult> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::CargoBuild(pkg.to_string()));
+            Ok(crate::executor::BuildResult {
+                success: self.build_ok,
+                stderr: if self.build_ok {
+                    None
+                } else {
+                    Some("fake build error".to_string())
+                },
+            })
+        }
+        async fn cargo_test(&self, pkg: &str) -> Result<bool> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::CargoTest(pkg.to_string()));
+            Ok(self.test_ok)
+        }
+        async fn hot_swap(&self, _swapper: &HotSwapper, mut old: Child) -> Result<Child> {
+            let _ = old.kill().await;
+            let child = tokio::process::Command::new("sleep")
+                .arg("9999")
+                .spawn()
+                .expect("sleep must exist");
+            Ok(child)
+        }
+    }
+
+    // Tier 2 テスト共通の入力データ
+    fn tier2_modules() -> (Vec<String>, Vec<String>) {
+        let names = vec![
+            "normalizer".to_string(),
+            "tokenizer".to_string(),
+            "parser".to_string(),
+            "evaluator".to_string(),
+        ];
+        let paths = vec![
+            "modules/normalizer/src/main.rs".to_string(),
+            "modules/tokenizer/src/main.rs".to_string(),
+            "modules/parser/src/main.rs".to_string(),
+            "modules/evaluator/src/main.rs".to_string(),
+        ];
+        (names, paths)
+    }
+
+    const JUDGE_EXTEND: &str =
+        r#"{"approach": "extend", "target_module": "normalizer", "reason": "既存で対応可能"}"#;
+    const JUDGE_NEW: &str =
+        r#"{"approach": "new", "target_module": "", "reason": "新規モジュール必要"}"#;
+    const NEW_MOD_SPEC: &str = r#"{
+        "name": "unicode_norm",
+        "insert_after": "normalizer",
+        "cargo_toml": "[package]\nname = \"unicode_norm\"\nversion = \"0.1.0\"\nedition = \"2021\"",
+        "main_rs": "// # CMP Module Charter\n// What: Unicode 正規化モジュール\nfn main() {}"
+    }"#;
+
+    /// extend 成功: build + test が通れば Extended を返し、CopyFile/WriteFile/Build/Test が走る
+    #[tokio::test]
+    async fn tier2_extend_adopted_when_build_and_test_pass() {
+        let ops = Arc::new(Mutex::new(vec![]));
+        let (module_names, module_paths) = tier2_modules();
+        let inputs = vec!["３ + ５".to_string()];
+        let metadata = make_metadata();
+
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(SequencedAi::new([JUDGE_EXTEND, "fn repaired() {}"])),
+            Box::new(TrackingExecutor {
+                build_ok: true,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                ops: Arc::clone(&ops),
+            }),
+        );
+
+        let outcome = cmp
+            .maybe_tier2(Tier2Context {
+                unknown_inputs: &inputs,
+                chain_module_names: &module_names,
+                module_source_paths: &module_paths,
+                unknown_count: 5,
+                tier2_trigger: 5,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Tier2Outcome::Extended { ref module_name } if module_name == "normalizer"),
+            "build+test pass → Extended(normalizer)"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|o| matches!(o, Op::CopyFile(..))),
+            "backup CopyFile must be recorded; ops={:?}",
+            recorded
+        );
+        assert!(
+            recorded.iter().any(|o| matches!(o, Op::WriteFile(..))),
+            "WriteFile must be recorded; ops={:?}",
+            recorded
+        );
+        assert!(
+            recorded.contains(&Op::CargoBuild("normalizer".to_string())),
+            "CargoBuild(normalizer) must be recorded; ops={:?}",
+            recorded
+        );
+        assert!(
+            recorded.contains(&Op::CargoTest("normalizer".to_string())),
+            "CargoTest(normalizer) must be recorded; ops={:?}",
+            recorded
+        );
+    }
+
+    /// extend 失敗 (build): Rejected を返し、バックアップからの CopyFile (ロールバック) が走る
+    #[tokio::test]
+    async fn tier2_extend_rejected_when_build_fails() {
+        let ops = Arc::new(Mutex::new(vec![]));
+        let (module_names, module_paths) = tier2_modules();
+        let inputs = vec!["３ + ５".to_string()];
+        let metadata = make_metadata();
+
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(SequencedAi::new([JUDGE_EXTEND, "broken code"])),
+            Box::new(TrackingExecutor {
+                build_ok: false,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                ops: Arc::clone(&ops),
+            }),
+        );
+
+        let outcome = cmp
+            .maybe_tier2(Tier2Context {
+                unknown_inputs: &inputs,
+                chain_module_names: &module_names,
+                module_source_paths: &module_paths,
+                unknown_count: 5,
+                tier2_trigger: 5,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Tier2Outcome::Rejected { .. }),
+            "build fail → Rejected"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        let copy_count = recorded
+            .iter()
+            .filter(|o| matches!(o, Op::CopyFile(..)))
+            .count();
+        assert!(
+            copy_count >= 2,
+            "backup + rollback CopyFile must both be recorded; ops={:?}",
+            recorded
+        );
+        assert!(
+            !recorded.contains(&Op::CargoTest("normalizer".to_string())),
+            "CargoTest must NOT be called when build fails; ops={:?}",
+            recorded
+        );
+    }
+
+    /// extend 失敗 (test): Rejected を返し、ロールバックと CargoTest が両方記録される
+    #[tokio::test]
+    async fn tier2_extend_rejected_when_test_fails() {
+        let ops = Arc::new(Mutex::new(vec![]));
+        let (module_names, module_paths) = tier2_modules();
+        let inputs = vec!["３ + ５".to_string()];
+        let metadata = make_metadata();
+
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(SequencedAi::new([JUDGE_EXTEND, "fn ok() {}"])),
+            Box::new(TrackingExecutor {
+                build_ok: true,
+                test_ok: false,
+                source: FAKE_SRC.to_string(),
+                ops: Arc::clone(&ops),
+            }),
+        );
+
+        let outcome = cmp
+            .maybe_tier2(Tier2Context {
+                unknown_inputs: &inputs,
+                chain_module_names: &module_names,
+                module_source_paths: &module_paths,
+                unknown_count: 5,
+                tier2_trigger: 5,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Tier2Outcome::Rejected { .. }),
+            "test fail → Rejected"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.contains(&Op::CargoBuild("normalizer".to_string())),
+            "CargoBuild must be recorded; ops={:?}",
+            recorded
+        );
+        assert!(
+            recorded.contains(&Op::CargoTest("normalizer".to_string())),
+            "CargoTest must be recorded even on failure; ops={:?}",
+            recorded
+        );
+        let copy_count = recorded
+            .iter()
+            .filter(|o| matches!(o, Op::CopyFile(..)))
+            .count();
+        assert!(
+            copy_count >= 2,
+            "backup + rollback CopyFile must both be recorded; ops={:?}",
+            recorded
+        );
+    }
+
+    /// new 成功: CreateDirAll / WriteFile×2 / CargoBuild / CargoTest が順に走り NewModule を返す
+    #[tokio::test]
+    async fn tier2_new_module_adopted_creates_files_and_builds() {
+        let ops = Arc::new(Mutex::new(vec![]));
+        let (module_names, module_paths) = tier2_modules();
+        let inputs = vec!["三 + 五".to_string()];
+        let metadata = make_metadata();
+
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(SequencedAi::new([JUDGE_NEW, NEW_MOD_SPEC])),
+            Box::new(TrackingExecutor {
+                build_ok: true,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                ops: Arc::clone(&ops),
+            }),
+        );
+
+        let outcome = cmp
+            .maybe_tier2(Tier2Context {
+                unknown_inputs: &inputs,
+                chain_module_names: &module_names,
+                module_source_paths: &module_paths,
+                unknown_count: 5,
+                tier2_trigger: 5,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Tier2Outcome::NewModule(ref spec) if spec.name == "unicode_norm"),
+            "build+test pass → NewModule(unicode_norm)"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|o| matches!(o, Op::CreateDirAll(p) if p.contains("unicode_norm"))),
+            "CreateDirAll must be recorded; ops={:?}",
+            recorded
+        );
+        let write_count = recorded
+            .iter()
+            .filter(|o| matches!(o, Op::WriteFile(..)))
+            .count();
+        assert!(
+            write_count >= 2,
+            "Cargo.toml + main.rs must both be written; ops={:?}",
+            recorded
+        );
+        assert!(
+            recorded.contains(&Op::CargoBuild("unicode_norm".to_string())),
+            "CargoBuild(unicode_norm) must be recorded; ops={:?}",
+            recorded
+        );
+        assert!(
+            recorded.contains(&Op::CargoTest("unicode_norm".to_string())),
+            "CargoTest(unicode_norm) must be recorded; ops={:?}",
+            recorded
+        );
+    }
+
+    /// new 失敗: build が通らない場合は RemoveDirAll でロールバックされ Rejected を返す
+    #[tokio::test]
+    async fn tier2_new_module_failed_build_removes_directory() {
+        let ops = Arc::new(Mutex::new(vec![]));
+        let (module_names, module_paths) = tier2_modules();
+        let inputs = vec!["三 + 五".to_string()];
+        let metadata = make_metadata();
+
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(SequencedAi::new([JUDGE_NEW, NEW_MOD_SPEC])),
+            Box::new(TrackingExecutor {
+                build_ok: false,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                ops: Arc::clone(&ops),
+            }),
+        );
+
+        let outcome = cmp
+            .maybe_tier2(Tier2Context {
+                unknown_inputs: &inputs,
+                chain_module_names: &module_names,
+                module_source_paths: &module_paths,
+                unknown_count: 5,
+                tier2_trigger: 5,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Tier2Outcome::Rejected { .. }),
+            "build fail → Rejected"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded
+                .iter()
+                .any(|o| matches!(o, Op::RemoveDirAll(p) if p.contains("unicode_norm"))),
+            "RemoveDirAll must be called on build failure; ops={:?}",
+            recorded
+        );
+    }
+
+    /// BelowThreshold: unknown_count < tier2_trigger のとき AI も executor も呼ばれない
+    #[tokio::test]
+    async fn tier2_below_threshold_no_ai_or_executor_calls() {
+        let ops = Arc::new(Mutex::new(vec![]));
+        let (module_names, module_paths) = tier2_modules();
+        let inputs = vec!["３ + ５".to_string()];
+        let metadata = make_metadata();
+
+        let cmp = CmpLoop::new_with_executor(
+            Box::new(SequencedAi::new(Vec::<String>::new())),
+            Box::new(TrackingExecutor {
+                build_ok: true,
+                test_ok: true,
+                source: FAKE_SRC.to_string(),
+                ops: Arc::clone(&ops),
+            }),
+        );
+
+        let outcome = cmp
+            .maybe_tier2(Tier2Context {
+                unknown_inputs: &inputs,
+                chain_module_names: &module_names,
+                module_source_paths: &module_paths,
+                unknown_count: 4,
+                tier2_trigger: 5,
+                metadata: &metadata,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome, Tier2Outcome::BelowThreshold),
+            "count < trigger → BelowThreshold"
+        );
+        let recorded = ops.lock().unwrap().clone();
+        assert!(
+            recorded.is_empty(),
+            "no executor ops should be recorded below threshold; ops={:?}",
+            recorded
         );
     }
 }
