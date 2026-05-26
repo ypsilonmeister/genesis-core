@@ -48,25 +48,28 @@ pub struct RepairContext<'a> {
 }
 
 pub struct CmpLoop {
-    claude: Box<dyn AiBackend>,
+    repair_ai: Box<dyn AiBackend>,
     executor: Box<dyn Executor>,
     pub tier1_trigger: u32,
     pub model_name: String,
 }
 
 impl CmpLoop {
-    pub fn new(claude: Box<dyn AiBackend>) -> Self {
-        Self::new_with_executor(claude, Box::new(SystemExecutor))
+    pub fn new(repair_ai: Box<dyn AiBackend>) -> Self {
+        Self::new_with_executor(repair_ai, Box::new(SystemExecutor))
     }
 
-    pub fn new_with_executor(claude: Box<dyn AiBackend>, executor: Box<dyn Executor>) -> Self {
+    pub fn new_with_executor(repair_ai: Box<dyn AiBackend>, executor: Box<dyn Executor>) -> Self {
         let tier1_trigger = std::env::var("TIER1_TRIGGER_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(3);
-        let model_name = std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-cli".to_string());
+        let model_name = std::env::var("REPAIR_MODEL")
+            .ok()
+            .or_else(|| std::env::var("CLAUDE_MODEL").ok())
+            .unwrap_or_else(|| "repair-ai".to_string());
         Self {
-            claude,
+            repair_ai,
             executor,
             tier1_trigger,
             model_name,
@@ -112,9 +115,9 @@ impl CmpLoop {
         );
 
         info!(module = %module_name, error_code = %error_code, count = error_count,
-              "Tier 1: requesting repair from claude");
-        let response = self.claude.complete(&initial_prompt).await
-            .context("Claude failed to generate repair proposal")?;
+              "Tier 1: requesting repair from repair AI");
+        let response = self.repair_ai.complete(&initial_prompt).await
+            .context("Repair AI failed to generate repair proposal")?;
         info!(module = %module_name, chars = response.len(), "Tier 1: received repair proposal");
 
         let initial_code = strip_code_fence(&response);
@@ -170,8 +173,8 @@ impl CmpLoop {
                     if build_ok { "テスト失敗" } else { "ビルドエラー" }
                 );
                 info!(module = %module_name, attempt = attempt + 1, max = max_retries,
-                      "Tier 1: requesting fix from claude");
-                let fix_response = self.claude.complete(&fix_prompt).await?;
+                      "Tier 1: requesting fix from repair AI");
+                let fix_response = self.repair_ai.complete(&fix_prompt).await?;
                 current_code = strip_code_fence(&fix_response);
             }
         }
@@ -278,12 +281,12 @@ impl CmpLoop {
             {{\"approach\": \"extend\" | \"new\", \"target_module\": \"モジュール名\", \"reason\": \"理由\"}}"
         );
 
-        info!("Tier 2: requesting judgment from claude");
+        info!("Tier 2: requesting judgment from repair AI");
         let judge_response = self
-            .claude
+            .repair_ai
             .complete(&judge_prompt)
             .await
-            .context("Claude failed to respond to Tier 2 judgment")?;
+            .context("Repair AI failed to respond to Tier 2 judgment")?;
 
         let judgment: serde_json::Value =
             parse_json_response(&judge_response).context("Failed to parse Tier 2 judgment")?;
@@ -324,7 +327,7 @@ impl CmpLoop {
                 出力: 修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。"
             );
 
-            let repair_code = self.claude.complete(&repair_prompt).await?;
+            let repair_code = self.repair_ai.complete(&repair_prompt).await?;
             let initial_code = strip_code_fence(&repair_code);
 
             // Layer B ゲート: Tier 2 extend での書き込みを許可確認
@@ -377,8 +380,8 @@ impl CmpLoop {
                         if build_ok { "テスト失敗" } else { "ビルドエラー" }
                     );
                     info!(target, attempt = attempt + 1, max = max_retries,
-                          "Tier 2: requesting fix from claude");
-                    let fix_response = self.claude.complete(&fix_prompt).await?;
+                          "Tier 2: requesting fix from repair AI");
+                    let fix_response = self.repair_ai.complete(&fix_prompt).await?;
                     current_code = strip_code_fence(&fix_response);
                 }
             }
@@ -442,6 +445,9 @@ impl CmpLoop {
                 - 既存モジュール (modules/normalizer) の通信プロトコルと同一形式\n\
                 - CMP Module Charter コメントを冒頭に書く\n\n\
                 出力形式: JSON のみ (説明不要)\n\
+                重要: \"cargo_toml\" や \"main_rs\" などの複数行のソースコードを JSON 内に埋め込む際、\n\
+                改行は \\n に、ダブルクォーテーション「\"」は \\\" に、バックスラッシュ「\\」は \\\\ に、\n\
+                規格に従って正しくエスケープしてください。有効な JSON 文字列を出力してください。\n\
                 {{\n\
                   \"name\": \"モジュール名 (snake_case)\",\n\
                   \"insert_after\": \"チェーン内の挿入位置 (どのモジュールの後か)\",\n\
@@ -450,10 +456,41 @@ impl CmpLoop {
                 }}"
             );
 
-            info!("Tier 2: requesting new module from claude");
-            let new_mod_response = self.claude.complete(&new_mod_prompt).await?;
-            let new_mod: serde_json::Value = parse_json_response(&new_mod_response)
-                .context("Failed to parse new module spec")?;
+            let mut attempts = 0;
+            let mut new_mod: Option<serde_json::Value> = None;
+            let mut current_prompt = new_mod_prompt.clone();
+
+            while attempts < 2 {
+                info!(
+                    attempt = attempts + 1,
+                    "Tier 2: requesting new module from repair AI"
+                );
+                let new_mod_response = self.repair_ai.complete(&current_prompt).await?;
+                match parse_json_response(&new_mod_response) {
+                    Ok(parsed) => {
+                        new_mod = Some(parsed);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            attempt = attempts + 1,
+                            error = %e,
+                            "Failed to parse new module JSON"
+                        );
+                        attempts += 1;
+                        if attempts < 2 {
+                            current_prompt = format!(
+                                "{}\n\n前回の出力は以下のパースエラーになりました:\n{}\n\n\
+                                上記のエラーを修正し、正しくエスケープされた有効な JSON のみを出力してください。",
+                                new_mod_prompt,
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+
+            let new_mod = new_mod.context("Failed to parse new module spec after retries")?;
 
             let mod_name = new_mod["name"]
                 .as_str()
@@ -588,10 +625,10 @@ impl CmpLoop {
         );
 
         let generated_summary = self
-            .claude
+            .repair_ai
             .complete(&summary_prompt)
             .await
-            .context("Claude failed to generate comprehension summary")?;
+            .context("Repair AI failed to generate comprehension summary")?;
         let generated_summary = generated_summary.trim().to_string();
 
         // Step 2: 要約と Charter の What を比較させる
@@ -607,10 +644,10 @@ impl CmpLoop {
         );
 
         let judge_response = self
-            .claude
+            .repair_ai
             .complete(&judge_prompt)
             .await
-            .context("Claude failed to judge comprehension")?;
+            .context("Repair AI failed to judge comprehension")?;
 
         let judgment = parse_json_response(&judge_response)
             .unwrap_or_else(|_| serde_json::json!({"match": "mismatch", "split_candidate": 0}));
@@ -652,7 +689,7 @@ impl CmpLoop {
     }
 }
 
-/// ビルド/テスト失敗時に Claude に修正を依頼する最大追加試行回数。
+/// ビルド/テスト失敗時に 修復 AI に修正を依頼する最大追加試行回数。
 /// FIX_RETRY_COUNT 環境変数で上書き可能 (デフォルト 2)。
 fn fix_retry_count() -> u32 {
     std::env::var("FIX_RETRY_COUNT")
@@ -674,7 +711,14 @@ fn parse_json_response(s: &str) -> Result<serde_json::Value> {
     // { ... } を探す
     let start = inner.find('{').unwrap_or(0);
     let end = inner.rfind('}').map(|i| i + 1).unwrap_or(inner.len());
-    serde_json::from_str(&inner[start..end]).context("JSON parse error")
+    let target = &inner[start..end];
+    serde_json::from_str(target).map_err(|e| {
+        anyhow::anyhow!(
+            "JSON parse error: {}\n--- Raw string attempted to parse ---\n{}\n-------------------------------------",
+            e,
+            target
+        )
+    })
 }
 
 pub struct Tier2Context<'a> {
@@ -759,7 +803,7 @@ fn extract_charter(code: &str) -> String {
     }
 }
 
-/// Claude が返す markdown コードフェンス (```rust ... ```) を剥がす。
+/// LLM が返す markdown コードフェンス (```rust ... ```) を剥がす。
 fn strip_code_fence(s: &str) -> String {
     let s = s.trim();
 
