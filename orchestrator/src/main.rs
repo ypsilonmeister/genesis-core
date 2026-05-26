@@ -36,7 +36,9 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::ai_backend::{build_claude_backend, build_gemini_backend};
+use crate::ai_backend::{
+    build_repair_backend, build_repair_fallback_backend, build_attack_backend, FallbackBackend,
+};
 use crate::attacker::{rand_attack_delay_secs, Attacker};
 use crate::chain::{ChainConfig, ModuleSpec};
 use crate::cmp_loop::{
@@ -63,13 +65,22 @@ async fn main() -> Result<()> {
     info!("genesis-core orchestrator booting");
 
     // 1. AI バックエンドを初期化
-    let claude = build_claude_backend()?;
-    let gemini = build_gemini_backend()?;
-    let cmp = CmpLoop::new(claude);
-    let attacker = Attacker::new(gemini);
+    // 修復 AI: プライマリとフォールバックバックエンドを使用する。
+    let repair_primary = build_repair_backend()?;
+    let repair_fallback = build_repair_fallback_backend()?;
+    let repair_ai = Box::new(FallbackBackend::new(
+        repair_primary,
+        repair_fallback,
+        "repair_primary",
+        "repair_fallback",
+    ));
+    let cmp = CmpLoop::new(repair_ai);
+    let attack_ai = build_attack_backend()?;
+    let attacker = Attacker::new(attack_ai);
+    let attacker_model_name = attacker.model_name.clone();
     info!(
-        claude_backend = %std::env::var("CLAUDE_BACKEND").unwrap_or_else(|_| "cli".to_string()),
-        gemini_backend = %std::env::var("GEMINI_BACKEND").unwrap_or_else(|_| "cli".to_string()),
+        repair_backend = %std::env::var("REPAIR_BACKEND").ok().or_else(|| std::env::var("CLAUDE_BACKEND").ok()).unwrap_or_else(|| "claude".to_string()),
+        attack_backend = %std::env::var("ATTACK_BACKEND").ok().or_else(|| std::env::var("GEMINI_BACKEND").ok()).unwrap_or_else(|| "gemini".to_string()),
         "AI backends initialized"
     );
 
@@ -435,7 +446,7 @@ async fn main() -> Result<()> {
             let all_inputs: Vec<String> = inputs.clone();
             let results_json = serde_json::Value::Array(attack_results);
             if let Err(e) = metadata.insert_attack(
-                "gemini-cli",
+                &attacker_model_name,
                 &all_inputs,
                 &std::env::var("ATTACK_PHASE").unwrap_or_else(|_| "A".to_string()),
                 attack_diversity,

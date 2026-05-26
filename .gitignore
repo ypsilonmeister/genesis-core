@@ -34,3 +34,4 @@ Thumbs.db
 *.tmp
 *.log
 .claude/settings.local.json
+.antigravitycli/*

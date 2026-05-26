@@ -7,7 +7,7 @@
 // Lying Calculator §5 に従う:
 //
 //   Tier 1 トリガ: 同一エラーコードが N 回以上発生(デフォルト 3)
-//     → claude_backend.complete(repair_prompt) で修復案を取得
+//     → repair_ai.complete(repair_prompt) で修復案を取得
 //     → cargo build + cargo test で検証
 //     → 通過したら hot_swap
 //     → 失敗もメタデータに転写(無編集)
@@ -74,7 +74,7 @@ impl CmpLoop {
     }
 
     /// Tier 1: 同一エラーコードが閾値回数以上発生したら Claude に修復を依頼し、
-    /// build → test → hot_swap → metadata 記録 まで行う。
+    /// build → test (→ エラー時は修正ループ) → hot_swap → metadata 記録 まで行う。
     pub async fn maybe_repair(&self, ctx: RepairContext<'_>) -> Result<(RepairOutcome, Child)> {
         let RepairContext {
             error_code,
@@ -90,160 +90,121 @@ impl CmpLoop {
             return Ok((RepairOutcome::BelowThreshold, old_child));
         }
 
-        // モジュールのソースコードと Charter を読む
         let module_code = self
             .executor
             .read_file(module_source_path)
             .with_context(|| format!("Cannot read {}", module_source_path))?;
-
         let module_charter = extract_charter(&module_code);
 
-        let prompt = format!(
+        let initial_prompt = format!(
             "以下のRustモジュールがエラーを繰り返しています。\n\n\
-            Module Charter:\n{}\n\n\
-            エラーコード: {}\n\
-            発生回数: {}\n\
-            モジュール名: {}\n\n\
-            現在のコード:\n```rust\n{}\n```\n\n\
+            Module Charter:\n{module_charter}\n\n\
+            エラーコード: {error_code}\n\
+            発生回数: {error_count}\n\
+            モジュール名: {module_name}\n\n\
+            現在のコード:\n```rust\n{module_code}\n```\n\n\
             修復案を生成してください。\n\
             制約:\n\
             - Module CharterのInvariantsを破らないこと\n\
             - Module CharterのBoundariesを変更しないこと\n\
             - 修正範囲は最小限にすること\n\n\
-            出力: 修正後のRustコード全体をコードブロックなしで出力してください。",
-            module_charter, error_code, error_count, module_name, module_code
+            出力: 修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。"
         );
 
-        info!(
-            module = %module_name,
-            error_code = %error_code,
-            count = error_count,
-            "Tier 1: requesting repair from claude"
-        );
-
-        let response = self
-            .claude
-            .complete(&prompt)
-            .await
+        info!(module = %module_name, error_code = %error_code, count = error_count,
+              "Tier 1: requesting repair from claude");
+        let response = self.claude.complete(&initial_prompt).await
             .context("Claude failed to generate repair proposal")?;
+        info!(module = %module_name, chars = response.len(), "Tier 1: received repair proposal");
 
-        info!(
-            module = %module_name,
-            chars = response.len(),
-            "Tier 1: received repair proposal"
-        );
+        let initial_code = strip_code_fence(&response);
 
-        // markdown コードブロックがあれば剥がす
-        let generated_code = strip_code_fence(&response);
-
-        // Layer B ゲート: RepairAi によるモジュールソース書き込みを許可確認
         enforce_hard_invariants(
             Actor::RepairAi,
             &Action::FileWrite {
                 path: std::path::PathBuf::from(module_source_path),
-                size_bytes: generated_code.len(),
+                size_bytes: initial_code.len(),
             },
         )
         .map_err(|e| anyhow::anyhow!("Charter violation before Tier1 write: {:?}", e))?;
 
-        // バックアップ → ファイル書き込み
+        // バックアップは最初の 1 回だけ取る
         let backup_path = format!("{}.bak", module_source_path);
-        self.executor
-            .copy_file(module_source_path, &backup_path)
+        self.executor.copy_file(module_source_path, &backup_path)
             .context("Failed to backup module source")?;
-        self.executor
-            .write_file(module_source_path, &generated_code)
-            .context("Failed to write repair proposal to source file")?;
 
-        // cargo build
-        let build_result = self
-            .executor
-            .cargo_build(module_name)
-            .await
-            .context("Failed to run cargo build")?;
+        // build/test ループ: 失敗時はエラー内容を渡して修正を依頼する
+        let max_retries = fix_retry_count();
+        let mut current_code = initial_code;
+        let mut build_ok = false;
+        let mut test_ok = false;
+        let mut final_build_error: Option<String> = None;
 
-        let build_ok = build_result.success;
-        let build_error = build_result.stderr;
+        for attempt in 0..=max_retries {
+            self.executor.write_file(module_source_path, &current_code)
+                .context("Failed to write code")?;
 
-        if !build_ok {
-            warn!(module = %module_name, "Tier 1: build failed, restoring backup");
-            self.executor
-                .copy_file(&backup_path, module_source_path)
-                .context("Failed to restore backup after build failure")?;
+            let build_result = self.executor.cargo_build(module_name).await?;
+            build_ok = build_result.success;
+            final_build_error = build_result.stderr.clone();
 
+            if build_ok {
+                test_ok = self.executor.cargo_test(module_name).await?;
+                if test_ok {
+                    break;
+                }
+            }
+
+            if attempt < max_retries {
+                let error_desc = if !build_ok {
+                    format!("ビルドエラー:\n{}",
+                        final_build_error.as_deref().unwrap_or("(不明)"))
+                } else {
+                    "テストが失敗しました。".to_string()
+                };
+                let fix_prompt = format!(
+                    "以下のRustコードで{}が発生しました。修正してください。\n\n\
+                    {error_desc}\n\n\
+                    コード:\n```rust\n{current_code}\n```\n\n\
+                    修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。",
+                    if build_ok { "テスト失敗" } else { "ビルドエラー" }
+                );
+                info!(module = %module_name, attempt = attempt + 1, max = max_retries,
+                      "Tier 1: requesting fix from claude");
+                let fix_response = self.claude.complete(&fix_prompt).await?;
+                current_code = strip_code_fence(&fix_response);
+            }
+        }
+
+        if !build_ok || !test_ok {
+            warn!(module = %module_name, "Tier 1: build/test failed after all retries, restoring backup");
+            self.executor.copy_file(&backup_path, module_source_path)
+                .context("Failed to restore backup")?;
+
+            let rejection_reason = if build_ok { "tests failed" } else { "build failed" };
             let rec = ModificationRecord {
                 timestamp: Utc::now().to_rfc3339(),
                 tier: 1,
                 module_name: module_name.to_string(),
                 trigger_type: error_code.to_string(),
                 trigger_count: error_count as i32,
-                prompt_full: prompt,
+                prompt_full: initial_prompt,
                 model_name: self.model_name.clone(),
-                generated_code: Some(generated_code),
-                build_result: "failure".to_string(),
-                build_error,
-                test_result: None,
+                generated_code: Some(current_code),
+                build_result: if build_ok { "success" } else { "failure" }.to_string(),
+                build_error: final_build_error,
+                test_result: if build_ok { Some("fail".to_string()) } else { None },
                 decision: "rejected".to_string(),
-                rejection_reason: Some("build failed".to_string()),
+                rejection_reason: Some(rejection_reason.to_string()),
                 adopted_at: None,
             };
             metadata.insert_modification(&rec)?;
-
-            return Ok((
-                RepairOutcome::Rejected {
-                    reason: "build failed".to_string(),
-                },
-                old_child,
-            ));
+            return Ok((RepairOutcome::Rejected { reason: rejection_reason.to_string() }, old_child));
         }
 
-        // cargo test
-        let test_ok = self
-            .executor
-            .cargo_test(module_name)
-            .await
-            .context("Failed to run cargo test")?;
-        let test_result = if test_ok { "pass" } else { "fail" };
-
-        if !test_ok {
-            warn!(module = %module_name, "Tier 1: tests failed, restoring backup");
-            self.executor
-                .copy_file(&backup_path, module_source_path)
-                .context("Failed to restore backup after test failure")?;
-
-            let rec = ModificationRecord {
-                timestamp: Utc::now().to_rfc3339(),
-                tier: 1,
-                module_name: module_name.to_string(),
-                trigger_type: error_code.to_string(),
-                trigger_count: error_count as i32,
-                prompt_full: prompt,
-                model_name: self.model_name.clone(),
-                generated_code: Some(generated_code),
-                build_result: "success".to_string(),
-                build_error: None,
-                test_result: Some(test_result.to_string()),
-                decision: "rejected".to_string(),
-                rejection_reason: Some("tests failed".to_string()),
-                adopted_at: None,
-            };
-            metadata.insert_modification(&rec)?;
-
-            return Ok((
-                RepairOutcome::Rejected {
-                    reason: "tests failed".to_string(),
-                },
-                old_child,
-            ));
-        }
-
-        // hot_swap
         info!(module = %module_name, "Tier 1: build+test passed, initiating hot_swap");
         let adopted_at = Utc::now().to_rfc3339();
-        let new_child = self
-            .executor
-            .hot_swap(hot_swapper, old_child)
-            .await
+        let new_child = self.executor.hot_swap(hot_swapper, old_child).await
             .context("hot_swap failed")?;
 
         let rec = ModificationRecord {
@@ -252,12 +213,12 @@ impl CmpLoop {
             module_name: module_name.to_string(),
             trigger_type: error_code.to_string(),
             trigger_count: error_count as i32,
-            prompt_full: prompt,
+            prompt_full: initial_prompt,
             model_name: self.model_name.clone(),
-            generated_code: Some(generated_code),
+            generated_code: Some(current_code),
             build_result: "success".to_string(),
             build_error: None,
-            test_result: Some(test_result.to_string()),
+            test_result: Some("pass".to_string()),
             decision: "adopted".to_string(),
             rejection_reason: None,
             adopted_at: Some(adopted_at),
@@ -328,7 +289,14 @@ impl CmpLoop {
             parse_json_response(&judge_response).context("Failed to parse Tier 2 judgment")?;
 
         let approach = judgment["approach"].as_str().unwrap_or("extend");
-        let target = judgment["target_module"].as_str().unwrap_or("normalizer");
+        let raw_target = judgment["target_module"].as_str().unwrap_or("");
+        // Claude が複数モジュール名を返すことがある ("tokenizer, parser, evaluator" など)。
+        // chain_module_names の中で raw_target に含まれる最初のものを正とする。
+        let target = chain_module_names
+            .iter()
+            .find(|n| raw_target == n.as_str() || raw_target.contains(n.as_str()))
+            .map(|n| n.as_str())
+            .unwrap_or_else(|| chain_module_names.first().map(|s| s.as_str()).unwrap_or("normalizer"));
         let reason = judgment["reason"].as_str().unwrap_or("").to_string();
         info!(approach, target, reason = %reason, "Tier 2: judgment received");
 
@@ -357,30 +325,67 @@ impl CmpLoop {
             );
 
             let repair_code = self.claude.complete(&repair_prompt).await?;
-            let new_code = strip_code_fence(&repair_code);
+            let initial_code = strip_code_fence(&repair_code);
 
             // Layer B ゲート: Tier 2 extend での書き込みを許可確認
             enforce_hard_invariants(
                 Actor::RepairAi,
                 &Action::FileWrite {
                     path: std::path::PathBuf::from(source_path.as_str()),
-                    size_bytes: new_code.len(),
+                    size_bytes: initial_code.len(),
                 },
             )
             .map_err(|e| anyhow::anyhow!("Charter violation before Tier2 extend write: {:?}", e))?;
 
-            // バックアップ → 書き込み → build → test
+            // バックアップは最初の 1 回だけ取る
             let backup = format!("{}.bak", source_path);
             self.executor.copy_file(source_path, &backup)?;
-            self.executor.write_file(source_path, &new_code)?;
 
-            let build_result = self.executor.cargo_build(target).await?;
-            let build_ok = build_result.success;
-            let build_error = build_result.stderr;
-            let test_ok = build_ok && self.executor.cargo_test(target).await?;
+            // build/test ループ: 失敗時はエラー内容を渡して修正を依頼する
+            let max_retries = fix_retry_count();
+            let mut current_code = initial_code;
+            let mut build_ok = false;
+            let mut test_ok = false;
+            let mut final_build_error: Option<String> = None;
 
-            if !test_ok {
+            for attempt in 0..=max_retries {
+                self.executor.write_file(source_path, &current_code)?;
+
+                let build_result = self.executor.cargo_build(target).await?;
+                build_ok = build_result.success;
+                final_build_error = build_result.stderr.clone();
+
+                if build_ok {
+                    test_ok = self.executor.cargo_test(target).await?;
+                    if test_ok {
+                        break;
+                    }
+                }
+
+                if attempt < max_retries {
+                    let error_desc = if !build_ok {
+                        format!("ビルドエラー:\n{}",
+                            final_build_error.as_deref().unwrap_or("(不明)"))
+                    } else {
+                        "テストが失敗しました。".to_string()
+                    };
+                    let fix_prompt = format!(
+                        "以下のRustコードで{}が発生しました。修正してください。\n\n\
+                        {error_desc}\n\n\
+                        コード:\n```rust\n{current_code}\n```\n\n\
+                        修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。",
+                        if build_ok { "テスト失敗" } else { "ビルドエラー" }
+                    );
+                    info!(target, attempt = attempt + 1, max = max_retries,
+                          "Tier 2: requesting fix from claude");
+                    let fix_response = self.claude.complete(&fix_prompt).await?;
+                    current_code = strip_code_fence(&fix_response);
+                }
+            }
+
+            if !build_ok || !test_ok {
                 self.executor.copy_file(&backup, source_path)?;
+                let rejection_reason = if build_ok { "tests failed" } else { "build failed" };
                 let rec = ModificationRecord {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     tier: 2,
@@ -389,17 +394,17 @@ impl CmpLoop {
                     trigger_count: unknown_count as i32,
                     prompt_full: repair_prompt,
                     model_name: self.model_name.clone(),
-                    generated_code: Some(new_code),
+                    generated_code: Some(current_code),
                     build_result: if build_ok { "success" } else { "failure" }.to_string(),
-                    build_error,
-                    test_result: Some("fail".to_string()),
+                    build_error: final_build_error,
+                    test_result: if build_ok { Some("fail".to_string()) } else { None },
                     decision: "rejected".to_string(),
-                    rejection_reason: Some("build or test failed".to_string()),
+                    rejection_reason: Some(rejection_reason.to_string()),
                     adopted_at: None,
                 };
                 metadata.insert_modification(&rec)?;
                 return Ok(Tier2Outcome::Rejected {
-                    reason: "build or test failed".to_string(),
+                    reason: rejection_reason.to_string(),
                 });
             }
 
@@ -412,7 +417,7 @@ impl CmpLoop {
                 trigger_count: unknown_count as i32,
                 prompt_full: repair_prompt,
                 model_name: self.model_name.clone(),
-                generated_code: Some(new_code),
+                generated_code: Some(current_code),
                 build_result: "success".to_string(),
                 build_error: None,
                 test_result: Some("pass".to_string()),
@@ -647,6 +652,15 @@ impl CmpLoop {
     }
 }
 
+/// ビルド/テスト失敗時に Claude に修正を依頼する最大追加試行回数。
+/// FIX_RETRY_COUNT 環境変数で上書き可能 (デフォルト 2)。
+fn fix_retry_count() -> u32 {
+    std::env::var("FIX_RETRY_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
 /// JSON レスポンスから値を抽出する (コードフェンスを剥がす)。
 fn parse_json_response(s: &str) -> Result<serde_json::Value> {
     let s = s.trim();
@@ -686,12 +700,34 @@ pub struct NewModuleSpec {
     pub insert_after: Option<String>,
 }
 
-/// Charter コメントの What: 行を抽出する。
+/// Charter コメントの What: セクションを抽出する (複数行対応)。
 fn extract_charter_what(code: &str) -> String {
-    for line in code.lines() {
+    let mut lines_iter = code.lines().peekable();
+    while let Some(line) = lines_iter.next() {
         let trimmed = line.trim().trim_start_matches('/').trim();
         if trimmed.starts_with("What:") {
-            return trimmed.trim_start_matches("What:").trim().to_string();
+            let inline = trimmed.trim_start_matches("What:").trim();
+            if !inline.is_empty() {
+                return inline.to_string();
+            }
+            // What: の内容が次行以降にある場合、インデントされたコメント行を収集する
+            let mut parts = Vec::new();
+            while let Some(next) = lines_iter.peek() {
+                let nc = next.trim().trim_start_matches('/').trim();
+                // 次のセクション見出し (例: "Invariants:") が来たら終了
+                if nc.ends_with(':') && !nc.starts_with('-') {
+                    break;
+                }
+                if nc.is_empty() {
+                    break;
+                }
+                parts.push(nc.to_string());
+                lines_iter.next();
+            }
+            if !parts.is_empty() {
+                return parts.join(" ");
+            }
+            return "(no What content)".to_string();
         }
     }
     "(no What section found)".to_string()
@@ -727,16 +763,35 @@ fn extract_charter(code: &str) -> String {
 fn strip_code_fence(s: &str) -> String {
     let s = s.trim();
 
-    // レスポンス中のどこにある ```rust / ``` ブロックでも抽出できるよう、
-    // 先頭一致ではなく最初の出現位置を探す。
-    // これにより日本語の説明文がコードブロックの前に付いていても正しく抽出できる。
+    // 1. コードフェンス (```rust / ```) がレスポンス中にあれば、そこから抽出する。
+    //    日本語の説明文がコードの前に付いていても正しく抽出できる。
     for fence in ["```rust", "```"] {
         if let Some(start) = s.find(fence) {
             let after_open = &s[start + fence.len()..];
-            // フェンス直後の改行を読み飛ばす
             let code_start = after_open.trim_start_matches('\n');
             if let Some(end) = code_start.find("```") {
                 return code_start[..end].trim().to_string();
+            }
+        }
+    }
+
+    // 2. コードフェンスがない場合: Rust コードらしい行頭を探してそこ以降を返す。
+    //    Claude がコードブロックなしで説明文 + コードを出力した場合のフォールバック。
+    const RUST_MARKERS: &[&str] = &[
+        "// # CMP", "// CMP", "use ", "pub use ", "pub fn ", "pub struct ",
+        "pub enum ", "fn main", "#[derive", "#![", "mod ",
+    ];
+    for marker in RUST_MARKERS {
+        // 行頭にあるか確認 (pos==0 または直前が改行)
+        let mut search_from = 0;
+        while let Some(pos) = s[search_from..].find(marker) {
+            let abs_pos = search_from + pos;
+            if abs_pos == 0 || s.as_bytes().get(abs_pos - 1) == Some(&b'\n') {
+                return s[abs_pos..].trim().to_string();
+            }
+            search_from = abs_pos + 1;
+            if search_from >= s.len() {
+                break;
             }
         }
     }
@@ -1207,7 +1262,11 @@ mod tests {
         let metadata = make_metadata();
 
         let cmp = CmpLoop::new_with_executor(
-            Box::new(SequencedAi::new([JUDGE_EXTEND, "broken code"])),
+            // 修正ループ (FIX_RETRY_COUNT=2) で合計 2 回 fix 呼び出しが発生するため
+            // JUDGE + initial + fix×2 = 4 レスポンスを用意する
+            Box::new(SequencedAi::new([
+                JUDGE_EXTEND, "broken code", "still broken 1", "still broken 2",
+            ])),
             Box::new(TrackingExecutor {
                 build_ok: false,
                 test_ok: true,
@@ -1258,7 +1317,11 @@ mod tests {
         let metadata = make_metadata();
 
         let cmp = CmpLoop::new_with_executor(
-            Box::new(SequencedAi::new([JUDGE_EXTEND, "fn ok() {}"])),
+            // 修正ループ (FIX_RETRY_COUNT=2) で合計 2 回 fix 呼び出しが発生するため
+            // JUDGE + initial + fix×2 = 4 レスポンスを用意する
+            Box::new(SequencedAi::new([
+                JUDGE_EXTEND, "fn ok() {}", "fn ok() {} // fix1", "fn ok() {} // fix2",
+            ])),
             Box::new(TrackingExecutor {
                 build_ok: true,
                 test_ok: false,

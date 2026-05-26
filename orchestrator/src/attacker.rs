@@ -14,18 +14,21 @@ use tracing::{info, warn};
 use crate::ai_backend::AiBackend;
 
 pub struct Attacker {
-    gemini: Box<dyn AiBackend>,
+    attack_ai: Box<dyn AiBackend>,
     pub phase: String,
     #[allow(dead_code)]
     pub model_name: String,
 }
 
 impl Attacker {
-    pub fn new(gemini: Box<dyn AiBackend>) -> Self {
+    pub fn new(attack_ai: Box<dyn AiBackend>) -> Self {
         let phase = std::env::var("ATTACK_PHASE").unwrap_or_else(|_| "A".to_string());
-        let model_name = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-cli".to_string());
+        let model_name = std::env::var("ATTACK_MODEL")
+            .ok()
+            .or_else(|| std::env::var("GEMINI_MODEL").ok())
+            .unwrap_or_else(|| "attack-ai".to_string());
         Self {
-            gemini,
+            attack_ai,
             phase,
             model_name,
         }
@@ -50,7 +53,7 @@ impl Attacker {
         let prompt = self.build_prompt(success_samples, recent_errors, diversity);
 
         let response = self
-            .gemini
+            .attack_ai
             .complete(&prompt)
             .await
             .context("Gemini failed to generate attacks")?;

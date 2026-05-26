@@ -10,7 +10,7 @@
 # 前提:
 #   - cargo build --workspace で全バイナリが target/debug/ に生成済み
 #   - claude CLI または Gemini CLI が PATH 上に存在
-#   - .env を編集して API キー等を設定済み (CLAUDE_BACKEND=cli の場合は不要)
+#   - .env を編集して API キー等を設定済み (CLI を使う場合は不要)
 #
 # ログ出力: RUST_LOG 環境変数で制御 (デフォルト: info,orchestrator=debug)
 # =============================================================================
@@ -29,8 +29,8 @@ if [ -f ".env" ]; then
 fi
 
 # デフォルト環境変数 (未設定時のみ適用)
-export CLAUDE_BACKEND="${CLAUDE_BACKEND:-cli}"
-export GEMINI_BACKEND="${GEMINI_BACKEND:-cli}"
+export REPAIR_BACKEND="${REPAIR_BACKEND:-${CLAUDE_BACKEND:-claude}}"
+export ATTACK_BACKEND="${ATTACK_BACKEND:-${GEMINI_BACKEND:-gemini}}"
 export ATTACK_PHASE="${ATTACK_PHASE:-D}"
 export ATTACK_INTERVAL_MIN_SECS="${ATTACK_INTERVAL_MIN_SECS:-30}"
 export ATTACK_INTERVAL_MAX_SECS="${ATTACK_INTERVAL_MAX_SECS:-180}"
@@ -42,7 +42,7 @@ export RUST_LOG="${RUST_LOG:-info,orchestrator=debug}"
 mkdir -p /tmp/genesis-core
 
 echo "[run.sh] genesis-core 30-day run started at $(date -Iseconds)"
-echo "[run.sh] ATTACK_PHASE=${ATTACK_PHASE}, CLAUDE_BACKEND=${CLAUDE_BACKEND}, GEMINI_BACKEND=${GEMINI_BACKEND}"
+echo "[run.sh] ATTACK_PHASE=${ATTACK_PHASE}, REPAIR_BACKEND=${REPAIR_BACKEND}, ATTACK_BACKEND=${ATTACK_BACKEND}"
 
 # ビルドが必要か確認
 if [ ! -f "target/debug/orchestrator" ]; then

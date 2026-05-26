@@ -4,14 +4,14 @@
 // =============================================================================
 // ai_backend.rs — AI バックエンド抽象化レイヤー
 //
-// 修復 AI (Claude) と攻撃 AI (Gemini) を共通の AiBackend trait で抽象化する。
+// 修復 AI (REPAIR) と攻撃 AI (ATTACK) を共通の AiBackend trait で抽象化する。
 // バックエンドは環境変数で切り替え:
-//   CLAUDE_BACKEND=cli (default) | api
-//   GEMINI_BACKEND=cli (default) | api
+//   REPAIR_BACKEND=claude (default) | gemini | agy | api
+//   ATTACK_BACKEND=gemini (default) | claude | agy | api
 //
-// CLI モード: claude/gemini コマンドをサブプロセスとして呼び出す。
+// CLI モード: 各 CLI コマンドをサブプロセスとして呼び出す。
 //   - API キー不要
-//   - claude -p "<prompt>" / gemini -p "<prompt>"
+//   - claude -p "<prompt>" / gemini -p "<prompt>" -y / agy -p "<prompt>" --dangerously-skip-permissions
 //
 // API モード: reqwest で各社 HTTP API を叩く。
 //   - ANTHROPIC_API_KEY / GEMINI_API_KEY が必要
@@ -20,6 +20,7 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
+use tracing::warn;
 
 #[async_trait]
 pub trait AiBackend: Send + Sync {
@@ -98,6 +99,42 @@ impl AiBackend for GeminiCli {
 
         let text =
             String::from_utf8(output.stdout).context("gemini cli output was not valid UTF-8")?;
+        Ok(text.trim().to_string())
+    }
+}
+
+pub struct AgyCli {
+    pub binary: String,
+}
+
+impl Default for AgyCli {
+    fn default() -> Self {
+        Self {
+            binary: "agy".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl AiBackend for AgyCli {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let output = tokio::process::Command::new(&self.binary)
+            .args(["-p", prompt, "--dangerously-skip-permissions"])
+            .output()
+            .await
+            .with_context(|| format!("Failed to run '{}'", self.binary))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "agy cli exited with {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        let text =
+            String::from_utf8(output.stdout).context("agy cli output was not valid UTF-8")?;
         Ok(text.trim().to_string())
     }
 }
@@ -246,47 +283,169 @@ impl AiBackend for GeminiApi {
 }
 
 // =============================================================================
-// ファクトリ
+// フォールバック合成
 // =============================================================================
 
-pub fn build_claude_backend() -> Result<Box<dyn AiBackend>> {
-    let mode = std::env::var("CLAUDE_BACKEND").unwrap_or_else(|_| "cli".to_string());
-    match mode.as_str() {
-        "cli" => {
-            let binary = std::env::var("CLAUDE_BINARY").unwrap_or_else(|_| "claude".to_string());
-            Ok(Box::new(ClaudeCli { binary }))
+/// primary が失敗したとき fallback に切り替えるラッパー。
+pub struct FallbackBackend {
+    primary: Box<dyn AiBackend>,
+    fallback: Box<dyn AiBackend>,
+    primary_name: String,
+    fallback_name: String,
+}
+
+impl FallbackBackend {
+    pub fn new(
+        primary: Box<dyn AiBackend>,
+        fallback: Box<dyn AiBackend>,
+        primary_name: impl Into<String>,
+        fallback_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            primary,
+            fallback,
+            primary_name: primary_name.into(),
+            fallback_name: fallback_name.into(),
         }
-        "api" => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
-                .context("ANTHROPIC_API_KEY is required when CLAUDE_BACKEND=api")?;
-            let model =
-                std::env::var("CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
-            Ok(Box::new(ClaudeApi::new(key, model)))
-        }
-        other => bail!(
-            "Unknown CLAUDE_BACKEND value: '{}' (expected 'cli' or 'api')",
-            other
-        ),
     }
 }
 
-pub fn build_gemini_backend() -> Result<Box<dyn AiBackend>> {
-    let mode = std::env::var("GEMINI_BACKEND").unwrap_or_else(|_| "cli".to_string());
-    match mode.as_str() {
-        "cli" => {
-            let binary = std::env::var("GEMINI_BINARY").unwrap_or_else(|_| "gemini".to_string());
-            Ok(Box::new(GeminiCli { binary }))
+#[async_trait]
+impl AiBackend for FallbackBackend {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        match self.primary.complete(prompt).await {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                warn!(
+                    primary = %self.primary_name,
+                    fallback = %self.fallback_name,
+                    error = %e,
+                    "primary AI failed, falling back"
+                );
+                self.fallback.complete(prompt).await
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ファクトリ
+// =============================================================================
+
+fn build_backend(
+    backend: &str,
+    binary: Option<String>,
+    api_provider: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+) -> Result<Box<dyn AiBackend>> {
+    match backend {
+        "claude" | "cli" => {
+            let bin = binary.unwrap_or_else(|| "claude".to_string());
+            Ok(Box::new(ClaudeCli { binary: bin }))
+        }
+        "gemini" => {
+            let bin = binary.unwrap_or_else(|| "gemini".to_string());
+            Ok(Box::new(GeminiCli { binary: bin }))
+        }
+        "agy" => {
+            let bin = binary.unwrap_or_else(|| "agy".to_string());
+            Ok(Box::new(AgyCli { binary: bin }))
         }
         "api" => {
-            let key = std::env::var("GEMINI_API_KEY")
-                .context("GEMINI_API_KEY is required when GEMINI_BACKEND=api")?;
-            let model =
-                std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
-            Ok(Box::new(GeminiApi::new(key, model)))
+            let provider = api_provider
+                .or_else(|| {
+                    model.as_ref().and_then(|m| {
+                        if m.contains("gemini") {
+                            Some("google".to_string())
+                        } else if m.contains("claude") {
+                            Some("anthropic".to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .context("API provider (google or anthropic) is required for api backend (either set REPAIR_API_PROVIDER/ATTACK_API_PROVIDER or use a model name containing 'gemini' or 'claude')")?;
+
+            match provider.as_str() {
+                "anthropic" => {
+                    let key = api_key.context("API key is required for anthropic provider (REPAIR_API_KEY / ANTHROPIC_API_KEY or ATTACK_API_KEY)")?;
+                    let m = model.unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+                    Ok(Box::new(ClaudeApi::new(key, m)))
+                }
+                "google" => {
+                    let key = api_key.context("API key is required for google provider (REPAIR_API_KEY / GEMINI_API_KEY or ATTACK_API_KEY)")?;
+                    let m = model.unwrap_or_else(|| "gemini-2.5-flash".to_string());
+                    Ok(Box::new(GeminiApi::new(key, m)))
+                }
+                other => bail!("Unknown API provider: '{}'", other),
+            }
         }
-        other => bail!(
-            "Unknown GEMINI_BACKEND value: '{}' (expected 'cli' or 'api')",
-            other
-        ),
+        other => bail!("Unknown backend type: '{}'", other),
     }
+}
+
+pub fn build_repair_backend() -> Result<Box<dyn AiBackend>> {
+    let backend = std::env::var("REPAIR_BACKEND")
+        .ok()
+        .or_else(|| std::env::var("CLAUDE_BACKEND").ok())
+        .unwrap_or_else(|| "claude".to_string());
+
+    let binary = std::env::var("REPAIR_BINARY")
+        .ok()
+        .or_else(|| std::env::var("CLAUDE_BINARY").ok());
+
+    let api_provider = std::env::var("REPAIR_API_PROVIDER").ok();
+    let model = std::env::var("REPAIR_MODEL")
+        .ok()
+        .or_else(|| std::env::var("CLAUDE_MODEL").ok());
+
+    let api_key = std::env::var("REPAIR_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+
+    build_backend(&backend, binary, api_provider, model, api_key)
+}
+
+pub fn build_repair_fallback_backend() -> Result<Box<dyn AiBackend>> {
+    let backend = std::env::var("REPAIR_FALLBACK_BACKEND")
+        .ok()
+        .unwrap_or_else(|| "gemini".to_string());
+
+    let binary = std::env::var("REPAIR_BINARY")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_BINARY").ok());
+
+    let api_provider = std::env::var("REPAIR_FALLBACK_API_PROVIDER").ok();
+    let model = std::env::var("REPAIR_FALLBACK_MODEL")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_MODEL").ok());
+
+    let api_key = std::env::var("REPAIR_FALLBACK_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_API_KEY").ok());
+
+    build_backend(&backend, binary, api_provider, model, api_key)
+}
+
+pub fn build_attack_backend() -> Result<Box<dyn AiBackend>> {
+    let backend = std::env::var("ATTACK_BACKEND")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_BACKEND").ok())
+        .unwrap_or_else(|| "gemini".to_string());
+
+    let binary = std::env::var("ATTACK_BINARY")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_BINARY").ok());
+
+    let api_provider = std::env::var("ATTACK_API_PROVIDER").ok();
+    let model = std::env::var("ATTACK_MODEL")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_MODEL").ok());
+
+    let api_key = std::env::var("ATTACK_API_KEY")
+        .ok()
+        .or_else(|| std::env::var("GEMINI_API_KEY").ok());
+
+    build_backend(&backend, binary, api_provider, model, api_key)
 }
