@@ -252,7 +252,10 @@ impl AiBackend for GeminiApi {
             self.model, self.api_key
         );
         let body = serde_json::json!({
-            "contents": [{"parts": [{"text": prompt}]}]
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": 8192
+            }
         });
 
         let resp = self
@@ -279,6 +282,65 @@ impl AiBackend for GeminiApi {
             .map(|p| p.text)
             .unwrap_or_default();
         Ok(text.trim().to_string())
+    }
+}
+
+pub struct OllamaApi {
+    pub host: String,
+    pub model: String,
+    client: reqwest::Client,
+}
+
+impl OllamaApi {
+    pub fn new(host: String, model: String) -> Self {
+        Self {
+            host,
+            model,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OllamaResponse {
+    message: OllamaMessage,
+}
+
+#[derive(Deserialize)]
+struct OllamaMessage {
+    content: String,
+}
+
+#[async_trait]
+impl AiBackend for OllamaApi {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let url = format!("{}/api/chat", self.host.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": false
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Ollama API request failed")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_text = resp.text().await.unwrap_or_default();
+            bail!("Ollama API returned status {}: {}", status, err_text);
+        }
+
+        let data: OllamaResponse = resp
+            .json()
+            .await
+            .context("Failed to parse Ollama response")?;
+        
+        Ok(data.message.content.trim().to_string())
     }
 }
 
@@ -352,6 +414,11 @@ fn build_backend(
             let bin = binary.unwrap_or_else(|| "agy".to_string());
             Ok(Box::new(AgyCli { binary: bin }))
         }
+        "ollama" => {
+            let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let m = model.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
+            Ok(Box::new(OllamaApi::new(host, m)))
+        }
         "api" => {
             let provider = api_provider
                 .or_else(|| {
@@ -381,7 +448,7 @@ fn build_backend(
                 other => bail!("Unknown API provider: '{}'", other),
             }
         }
-        other => bail!("Unknown backend type: '{}'", other),
+        other => bail!("Unknown backend type: '{}' (expected 'claude', 'gemini', 'agy', 'ollama' or 'api')", other),
     }
 }
 

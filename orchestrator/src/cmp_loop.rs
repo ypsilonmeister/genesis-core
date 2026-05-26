@@ -443,7 +443,9 @@ impl CmpLoop {
                 要件:\n\
                 - モジュールは UDS (Unix Domain Socket) 経由で JSON を受け取り返す\n\
                 - 既存モジュール (modules/normalizer) の通信プロトコルと同一形式\n\
-                - CMP Module Charter コメントを冒頭に書く\n\n\
+                - CMP Module Charter コメントを冒頭に書く\n\
+                - 出力サイズ制限（トークン切れ）を防ぐため、コードおよび Cargo.toml は極めて簡潔かつ最小限に実装してください。\n\
+                - Cargo.toml の dependencies は、必要最小限の依存関係 (tokio, serde, serde_json, thiserror, anyhow, tracing) のみに限定し、不要なパッケージを含めないでください。\n\n\
                 出力形式: JSON のみ (説明不要)\n\
                 重要: \"cargo_toml\" や \"main_rs\" などの複数行のソースコードを JSON 内に埋め込む際、\n\
                 改行は \\n に、ダブルクォーテーション「\"」は \\\" に、バックスラッシュ「\\」は \\\\ に、\n\
