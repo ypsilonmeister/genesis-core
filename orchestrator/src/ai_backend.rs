@@ -11,7 +11,7 @@
 //
 // CLI モード: 各 CLI コマンドをサブプロセスとして呼び出す。
 //   - API キー不要
-//   - claude -p "<prompt>" / gemini -p "<prompt>" -y / agy -p "<prompt>" --dangerously-skip-permissions
+//   - claude (stdin経由) / gemini -y (stdin経由) / agy --dangerously-skip-permissions (stdin経由)
 //
 // API モード: reqwest で各社 HTTP API を叩く。
 //   - ANTHROPIC_API_KEY / GEMINI_API_KEY が必要
@@ -82,7 +82,7 @@ impl AiBackend for ClaudeCli {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
-                "claude cli exited with {}: {}",
+                "{} exited with {}: {}", self.binary,
                 output.status,
                 stderr.trim()
             );
@@ -133,7 +133,8 @@ impl AiBackend for GeminiCli {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!(
-                "gemini cli exited with {}: {}",
+                "{} exited with {}: {}",
+                self.binary,
                 output.status,
                 stderr.trim()
             );
@@ -183,7 +184,12 @@ impl AiBackend for AgyCli {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("agy cli exited with {}: {}", output.status, stderr.trim());
+            bail!(
+                "{} exited with {}: {}",
+                self.binary,
+                output.status,
+                stderr.trim()
+            );
         }
 
         let text =
