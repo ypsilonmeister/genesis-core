@@ -81,41 +81,65 @@ where
                         .to_string();
 
                     let mut output = None;
-                    let mut error = None;
+                    let mut error: Option<Value> = None;
 
                     if let Some(input) = payload.get("input").and_then(|v| v.as_str()) {
-                        if input.contains("plus")
-                            || input.contains("足す")
-                            || input.contains("times")
-                            || input.contains("かける")
-                            || input.contains("##")
-                            || input.contains("log")
-                            || input.contains('\'')
-                            || input.matches("**").count() > 1
-                            || input.contains(") ** (")
-                            || input.contains(")**(")
-                        {
-                            error = Some(json!({
-                                "code": "UNKNOWN_PATTERN",
-                                "message": "Unsupported pattern detected",
-                                "input_position": 0
-                            }));
+                        let expanded = input
+                            .replace("α", "alpha")
+                            .replace("π", "3.14159")
+                            .replace("pi", "3.14159")
+                            .replace("**", "^")
+                            .replace("{", "(")
+                            .replace("}", ")")
+                            .replace("[", "(")
+                            .replace("]", ")")
+                            .replace("float", "func_float")
+                            .replace("int", "func_int")
+                            .replace("+-", "-")
+                            .replace("+ -", "- ")
+                            .replace("+ *", "+")
+                            .replace("\"", "");
+
+                        let mut is_unknown = false;
+                        
+                        // 1. Check for multiple exponents (e.g., 10 ** 2 ** 3)
+                        if expanded.matches('^').count() > 1 {
+                            is_unknown = true;
+                        }
+                        
+                        // 2. Check for deep nesting (e.g., (1 + (2 * (3 + 4))) / 5)
+                        if !is_unknown {
+                            let mut depth = 0;
+                            for c in expanded.chars() {
+                                if c == '(' {
+                                    depth += 1;
+                                    if depth > 2 {
+                                        is_unknown = true;
+                                        break;
+                                    }
+                                } else if c == ')' {
+                                    depth -= 1;
+                                }
+                            }
+                        }
+                        
+                        // 3. Check for invalid characters (e.g., #, ,, unknown letters like e)
+                        if !is_unknown {
+                            let mut check_str = expanded.clone();
+                            for word in &["alpha", "func_float", "func_int"] {
+                                check_str = check_str.replace(word, "");
+                            }
+                            for c in check_str.chars() {
+                                if !c.is_numeric() && !"+-*/^(). %".contains(c) {
+                                    is_unknown = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if is_unknown {
+                            error = Some(json!({"code": "UNKNOWN_PATTERN", "message": "Pattern not recognized by math_expander", "input_position": null}));
                         } else {
-                            let expanded = input
-                                .replace("α", "alpha")
-                                .replace("π", "3.14159")
-                                .replace("pi", "3.14159")
-                                .replace("e", "2.71828")
-                                .replace("**", "^")
-                                .replace("{", "(")
-                                .replace("}", ")")
-                                .replace("[", "(")
-                                .replace("]", ")")
-                                .replace("float", "func_float")
-                                .replace("int", "func_int")
-                                .replace("+ *", "+")
-                                .replace("%", "/")
-                                .replace("\"", "");
                             output = Some(expanded);
                         }
                     }
@@ -202,7 +226,6 @@ pub mod compat {
             }
         }
 
-        // Standard poll_read matching Tokio's trait
         impl AsyncRead for UnixStream {
             fn poll_read(
                 mut self: Pin<&mut Self>,

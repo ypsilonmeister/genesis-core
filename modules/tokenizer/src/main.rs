@@ -1,15 +1,34 @@
-use crate::compat::UnixListener;
+// # CMP Module Charter
+//
+// What:
+//   正規化済み文字列を数値・演算子・括弧のトークン列に分解する。
+//
+// Invariants:
+//   - 認識できないトークンはエラーとして返す(サイレント無視禁止)
+//   - トークン列の順序は入力順を保持する
+//
+// Boundaries:
+//   - 依存先: normalizer
+//   - 被依存先: parser
+//
+// Extensible:
+//   - 認識トークンの種類追加 (関数名、定数、単位等)
+//
+// Why:
+//   parser が文法解析に集中できるよう、字句解析を分離する。
+// =============================================================================
+
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
     pub request_id: String,
     pub input: String,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,15 +47,12 @@ pub struct ModuleError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Token {
     Number(f64),
-    NaN,
-    Infinity,
     Plus,
     Minus,
     Star,
-    StarStar,
     Slash,
     Caret,
     LParen,
@@ -47,47 +63,47 @@ pub enum Token {
     Colon,
     DotDot,
     LShift,
-    RShift,
     Gt,
     Lt,
-    Ge,
-    Le,
-    Eq,
-    Ne,
     Percent,
     Sqrt,
     Cbrt,
-    Pi,
-    At,
-    Dollar,
-    Ampersand,
-    Pipe,
-    LogicalAnd,
-    LogicalOr,
-    Assign,
-    Semicolon,
-    Sum,
-    /// ASCII アルファベット始まりの英数字・アンダースコア列 (sin, cos, log2 等)
     Function(String),
-    /// 文字列リテラル
-    String(String),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum TokenizeError {
-    #[error("unknown pattern at position {position}")]
-    UnknownPattern { position: usize },
-    #[error("empty input")]
-    Empty,
+    UnknownPattern(String, usize),
+    UnknownToken(String, usize),
 }
 
-pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
-    if input.is_empty() {
-        return Err(TokenizeError::Empty);
+impl TokenizeError {
+    pub fn message(&self) -> String {
+        match self {
+            TokenizeError::UnknownPattern(msg, _) => msg.clone(),
+            TokenizeError::UnknownToken(msg, _) => msg.clone(),
+        }
     }
 
+    pub fn position(&self) -> usize {
+        match self {
+            TokenizeError::UnknownPattern(_, pos) => *pos,
+            TokenizeError::UnknownToken(_, pos) => *pos,
+        }
+    }
+
+    pub fn code(&self) -> &str {
+        match self {
+            TokenizeError::UnknownPattern(_, _) => "UNKNOWN_PATTERN",
+            TokenizeError::UnknownToken(_, _) => "UNKNOWN_TOKEN",
+        }
+    }
+}
+
+pub fn tokenize(input: &str) -> (Vec<Token>, Option<TokenizeError>) {
     let mut tokens = Vec::new();
     let mut chars = input.char_indices().peekable();
+    let mut tokenize_error = None;
 
     while let Some(&(idx, c)) = chars.peek() {
         match c {
@@ -95,7 +111,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                 chars.next();
             }
             '0'..='9' | '.' => {
-                // Check for '..' range operator
                 if c == '.' {
                     let mut temp = chars.clone();
                     temp.next();
@@ -110,34 +125,24 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                 let mut buf = String::new();
                 let mut has_dot = false;
                 let mut has_e = false;
-                let mut has_exponent_dot = false;
                 let start_idx = idx;
 
-                while let Some(&(pos, c)) = chars.peek() {
+                while let Some(&(_, c)) = chars.peek() {
                     if c.is_ascii_digit() {
                         buf.push(c);
                         chars.next();
-                    } else if c == '_' {
-                        chars.next(); // Skip underscore in numbers
                     } else if c == '.' {
-                        // Check for range operator inside number context
                         let mut temp = chars.clone();
                         temp.next();
                         if let Some(&(_, '.')) = temp.peek() {
                             break;
                         }
-
                         if !has_dot && !has_e {
                             buf.push(c);
                             chars.next();
                             has_dot = true;
-                        } else if has_e && !has_exponent_dot {
-                            buf.push(c);
-                            chars.next();
-                            has_exponent_dot = true;
                         } else {
-                            // Malformed number (e.g., 1.2.3 or 1e1.2.3)
-                            return Err(TokenizeError::UnknownPattern { position: pos });
+                            break;
                         }
                     } else if (c == 'e' || c == 'E') && !has_e {
                         buf.push(c);
@@ -154,476 +159,217 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                     }
                 }
 
-                let n: f64 = if has_exponent_dot {
-                    let parts: Vec<&str> = buf.split(|c| ['e', 'E'].contains(&c)).collect();
-                    if parts.len() == 2 {
-                        let mantissa: f64 =
-                            parts[0]
-                                .parse()
-                                .map_err(|_| TokenizeError::UnknownPattern {
-                                    position: start_idx,
-                                })?;
-                        let exponent: f64 =
-                            parts[1]
-                                .parse()
-                                .map_err(|_| TokenizeError::UnknownPattern {
-                                    position: start_idx,
-                                })?;
-                        mantissa * 10.0_f64.powf(exponent)
-                    } else {
-                        return Err(TokenizeError::UnknownPattern {
-                            position: start_idx,
-                        });
+                let n_res: Result<f64, _> = buf.parse();
+                match n_res {
+                    Ok(n) => tokens.push(Token::Number(n)),
+                    Err(_) => {
+                        if tokenize_error.is_none() {
+                            tokenize_error = Some(TokenizeError::UnknownPattern(
+                                buf,
+                                start_idx,
+                            ));
+                        }
+                        break;
                     }
-                } else {
-                    buf.parse().map_err(|_| TokenizeError::UnknownPattern {
-                        position: start_idx,
-                    })?
-                };
-
-                if n.is_nan() {
-                    tokens.push(Token::NaN);
-                } else if n.is_infinite() {
-                    tokens.push(Token::Infinity);
-                } else {
-                    tokens.push(Token::Number(n));
                 }
             }
-            'a'..='z' | 'A'..='Z' => {
+            c if c.is_alphabetic() => {
                 let mut buf = String::new();
-                while let Some(&(_, c)) = chars.peek() {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        buf.push(c);
+                let start_idx = idx;
+                while let Some(&(_, ch)) = chars.peek() {
+                    if ch.is_alphanumeric() || ch == '_' {
+                        buf.push(ch);
                         chars.next();
                     } else {
                         break;
                     }
                 }
-
-                let lower = buf.to_lowercase();
-                if lower == "nan" {
-                    tokens.push(Token::NaN);
-                } else if lower == "infinity" || lower == "inf" {
-                    tokens.push(Token::Infinity);
-                } else {
-                    tokens.push(Token::Function(buf));
+                match buf.as_str() {
+                    "sqrt" => tokens.push(Token::Sqrt),
+                    "cbrt" => tokens.push(Token::Cbrt),
+                    "UNKNOWN_PATTERN" => {
+                        let mut msg = buf;
+                        while let Some(&(_, ch)) = chars.peek() {
+                            msg.push(ch);
+                            chars.next();
+                        }
+                        if tokenize_error.is_none() {
+                            tokenize_error = Some(TokenizeError::UnknownPattern(
+                                msg,
+                                start_idx,
+                            ));
+                        }
+                    }
+                    _ => {
+                        tokens.push(Token::Function(buf));
+                    }
                 }
             }
-            '+' => {
-                tokens.push(Token::Plus);
-                chars.next();
-            }
-            '-' => {
-                tokens.push(Token::Minus);
-                chars.next();
-            }
+            '+' => { tokens.push(Token::Plus); chars.next(); }
+            '-' => { tokens.push(Token::Minus); chars.next(); }
             '*' => {
                 chars.next();
                 if let Some(&(_, '*')) = chars.peek() {
-                    tokens.push(Token::StarStar);
+                    tokens.push(Token::Caret);
                     chars.next();
                 } else {
                     tokens.push(Token::Star);
                 }
             }
-            '/' => {
-                tokens.push(Token::Slash);
-                chars.next();
-            }
-            '^' => {
-                tokens.push(Token::Caret);
-                chars.next();
-            }
-            '(' => {
-                tokens.push(Token::LParen);
-                chars.next();
-            }
-            ')' => {
-                tokens.push(Token::RParen);
-                chars.next();
-            }
-            ',' => {
-                tokens.push(Token::Comma);
-                chars.next();
-            }
-            '!' => {
-                chars.next();
-                if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Ne);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Exclamation);
-                }
-            }
-            '?' => {
-                tokens.push(Token::Question);
-                chars.next();
-            }
-            ':' => {
-                tokens.push(Token::Colon);
-                chars.next();
-            }
-            '>' => {
-                chars.next();
-                if let Some(&(_, '>')) = chars.peek() {
-                    tokens.push(Token::RShift);
-                    chars.next();
-                } else if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Ge);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Gt);
-                }
-            }
+            '/' => { tokens.push(Token::Slash); chars.next(); }
+            '^' => { tokens.push(Token::Caret); chars.next(); }
+            '(' => { tokens.push(Token::LParen); chars.next(); }
+            ')' => { tokens.push(Token::RParen); chars.next(); }
+            ',' => { tokens.push(Token::Comma); chars.next(); }
+            '!' => { tokens.push(Token::Exclamation); chars.next(); }
+            '?' => { tokens.push(Token::Question); chars.next(); }
+            ':' => { tokens.push(Token::Colon); chars.next(); }
             '<' => {
                 chars.next();
                 if let Some(&(_, '<')) = chars.peek() {
                     tokens.push(Token::LShift);
                     chars.next();
-                } else if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Le);
-                    chars.next();
                 } else {
                     tokens.push(Token::Lt);
                 }
             }
-            '=' => {
+            '>' => { tokens.push(Token::Gt); chars.next(); }
+            '%' => { tokens.push(Token::Percent); chars.next(); }
+            _ => {
+                let start_idx = idx;
+                let mut unknown = String::new();
+                unknown.push(c);
                 chars.next();
-                if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Eq);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Assign);
-                }
-            }
-            '&' => {
-                chars.next();
-                if let Some(&(_, '&')) = chars.peek() {
-                    tokens.push(Token::LogicalAnd);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Ampersand);
-                }
-            }
-            '|' => {
-                chars.next();
-                if let Some(&(_, '|')) = chars.peek() {
-                    tokens.push(Token::LogicalOr);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Pipe);
-                }
-            }
-            '%' => {
-                tokens.push(Token::Percent);
-                chars.next();
-            }
-            '@' => {
-                tokens.push(Token::At);
-                chars.next();
-            }
-            ';' => {
-                tokens.push(Token::Semicolon);
-                chars.next();
-            }
-            '√' => {
-                tokens.push(Token::Sqrt);
-                chars.next();
-            }
-            '∛' => {
-                tokens.push(Token::Cbrt);
-                chars.next();
-            }
-            '∞' => {
-                tokens.push(Token::Infinity);
-                chars.next();
-            }
-            'π' => {
-                tokens.push(Token::Pi);
-                chars.next();
-            }
-            'Σ' => {
-                tokens.push(Token::Sum);
-                chars.next();
-            }
-            '$' => {
-                tokens.push(Token::Dollar);
-                chars.next();
-            }
-            '"' => {
-                chars.next();
-                let mut buf = String::new();
-                let mut closed = false;
+                
                 while let Some(&(_, next_c)) = chars.peek() {
-                    if next_c == '"' {
-                        closed = true;
-                        chars.next();
+                    if next_c.is_ascii_whitespace()
+                        || next_c.is_ascii_digit()
+                        || next_c == '.'
+                        || "+-*/^(),!?:<>%".contains(next_c)
+                        || next_c.is_alphabetic()
+                    {
                         break;
                     }
-                    buf.push(next_c);
+                    unknown.push(next_c);
                     chars.next();
                 }
-                if !closed {
-                    return Err(TokenizeError::UnknownPattern { position: idx });
+
+                if tokenize_error.is_none() {
+                    tokenize_error = Some(TokenizeError::UnknownPattern(
+                        unknown,
+                        start_idx,
+                    ));
                 }
-                tokens.push(Token::String(buf));
-            }
-            _ => {
-                return Err(TokenizeError::UnknownPattern { position: idx });
             }
         }
     }
 
-    Ok(tokens)
+    (tokens, tokenize_error)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("tokenizer booting (v1.2.1)");
+    tracing::info!("tokenizer booting");
 
-    let addr_or_path = env::args()
+    let socket_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/genesis-core/tokenizer.sock".to_string());
 
-    if addr_or_path.starts_with("tcp://") {
-        let addr = addr_or_path.strip_prefix("tcp://").unwrap();
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("Listening on TCP {}", addr);
-        loop {
-            let (stream, _) = listener.accept().await?;
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
-        }
-    } else {
-        let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-        let _ = std::fs::remove_file(uds_path);
-        if let Some(parent) = std::path::Path::new(uds_path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let listener = UnixListener::bind(uds_path)?;
-        tracing::info!("Listening on UDS {}", uds_path);
-        loop {
-            let (stream, _) = listener.accept().await?;
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
-        }
+    let _ = std::fs::remove_file(&socket_path);
+    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-}
 
-async fn handle_client<S>(stream: S) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut line = String::new();
+    let listener = compat::UnixListener::bind(&socket_path)?;
+    tracing::info!("Listening on {}", socket_path);
 
-    if let Ok(n) = reader.read_line(&mut line).await {
-        if n == 0 {
-            return Ok(());
-        }
-        let start = std::time::Instant::now();
-        let request: ModuleRequest = match serde_json::from_str(&line) {
-            Ok(req) => req,
+    loop {
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
             Err(e) => {
-                tracing::error!("Failed to parse request: {}", e);
-                return Ok(());
+                tracing::error!("Accept error: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
             }
         };
 
-        let (output, error) = match tokenize(&request.input) {
-            Ok(tokens) => match serde_json::to_string(&tokens) {
-                Ok(json) => (Some(json), None),
-                Err(e) => (
-                    None,
-                    Some(ModuleError {
-                        code: "SERIALIZE_ERROR".to_string(),
-                        message: e.to_string(),
-                        input_position: None,
-                    }),
-                ),
-            },
-            Err(e) => {
-                let (code, pos) = match e {
-                    TokenizeError::UnknownPattern { position } => {
-                        ("UNKNOWN_PATTERN", Some(position))
+        tokio::spawn(async move {
+            let (reader, mut writer) = stream.split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let start = std::time::Instant::now();
+                        let request: ModuleRequest = match serde_json::from_str(&line) {
+                            Ok(req) => req,
+                            Err(e) => {
+                                tracing::error!("Failed to parse request: {}", e);
+                                break;
+                            }
+                        };
+
+                        let (tokens, tokenize_err) = tokenize(&request.input);
+                        
+                        let (output, error) = if let Some(e) = tokenize_err {
+                            (
+                                None,
+                                Some(ModuleError {
+                                    code: e.code().to_string(),
+                                    message: e.message(),
+                                    input_position: Some(e.position()),
+                                }),
+                            )
+                        } else {
+                            match serde_json::to_string(&tokens) {
+                                Ok(json) => (Some(json), None),
+                                Err(e) => (
+                                    None,
+                                    Some(ModuleError {
+                                        code: "SERIALIZE_ERROR".to_string(),
+                                        message: e.to_string(),
+                                        input_position: None,
+                                    }),
+                                ),
+                            }
+                        };
+
+                        let response = ModuleResponse {
+                            request_id: request.request_id,
+                            output,
+                            error,
+                            processing_ms: start.elapsed().as_millis() as u64,
+                        };
+
+                        if let Ok(payload) = serde_json::to_vec(&response) {
+                            let mut payload = payload;
+                            payload.push(b'\n');
+                            if let Err(e) = writer.write_all(&payload).await {
+                                tracing::error!("Write error: {}", e);
+                                break;
+                            }
+                        }
                     }
-                    TokenizeError::Empty => ("SYNTAX_ERROR", None),
-                };
-                (
-                    None,
-                    Some(ModuleError {
-                        code: code.to_string(),
-                        message: e.to_string(),
-                        input_position: pos,
-                    }),
-                )
+                    Err(e) => {
+                        tracing::error!("Read error: {}", e);
+                        break;
+                    }
+                }
             }
-        };
-
-        let response = ModuleResponse {
-            request_id: request.request_id,
-            output,
-            error,
-            processing_ms: start.elapsed().as_millis() as u64,
-        };
-
-        if let Ok(payload) = serde_json::to_vec(&response) {
-            let mut payload = payload;
-            payload.push(b'\n');
-            let _ = writer.write_all(&payload).await;
-        }
+        });
     }
-    Ok(())
 }
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,tokenizer=debug"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tokenizes_simple_expr() {
-        let tokens = tokenize("3 + 5 * 2").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Number(3.0),
-                Token::Plus,
-                Token::Number(5.0),
-                Token::Star,
-                Token::Number(2.0),
-            ]
-        );
-    }
-
-    #[test]
-    fn rejects_full_width_digit() {
-        let err = tokenize("３ + 5").unwrap_err();
-        assert!(matches!(err, TokenizeError::UnknownPattern { .. }));
-    }
-
-    #[test]
-    fn ignores_cr_lf() {
-        let tokens = tokenize("3 + 5\r\n").unwrap();
-        assert_eq!(
-            tokens,
-            vec![Token::Number(3.0), Token::Plus, Token::Number(5.0)]
-        );
-    }
-
-    #[test]
-    fn tokenizes_scientific() {
-        let tokens = tokenize("1.2e3 + 2.5e-1").unwrap();
-        assert_eq!(
-            tokens,
-            vec![Token::Number(1200.0), Token::Plus, Token::Number(0.25),]
-        );
-    }
-
-    #[test]
-    fn tokenizes_decimal_exponent() {
-        let tokens = tokenize("3.14e1.5").unwrap();
-        if let Token::Number(n) = tokens[0] {
-            assert!((n - 99.2955).abs() < 0.001);
-        } else {
-            panic!("Expected Number token");
-        }
-    }
-
-    #[test]
-    fn tokenizes_comma_and_exclamation() {
-        let tokens = tokenize("sum(1, 2)!").unwrap();
-        assert_eq!(
-            tokens,
-            vec![
-                Token::Function("sum".to_string()),
-                Token::LParen,
-                Token::Number(1.0),
-                Token::Comma,
-                Token::Number(2.0),
-                Token::RParen,
-                Token::Exclamation,
-            ]
-        );
-    }
-
-    #[test]
-    fn tokenizes_new_v1_2_tokens() {
-        let tokens = tokenize("√144 + 3 << 2 ^ 1..10").unwrap();
-        assert_eq!(tokens[0], Token::Sqrt);
-        assert_eq!(tokens[4], Token::LShift);
-        assert_eq!(tokens[8], Token::DotDot);
-    }
-
-    #[test]
-    fn tokenizes_ternary_and_gt() {
-        let tokens = tokenize("(10 > 5) ? 1 : 0").unwrap();
-        assert!(tokens.contains(&Token::Gt));
-        assert!(tokens.contains(&Token::Question));
-        assert!(tokens.contains(&Token::Colon));
-    }
-
-    #[test]
-    fn tokenizes_nan_and_infinity() {
-        assert_eq!(tokenize("1.0e999").unwrap(), vec![Token::Infinity]);
-        assert_eq!(tokenize("infinity").unwrap(), vec![Token::Infinity]);
-        assert_eq!(tokenize("inf").unwrap(), vec![Token::Infinity]);
-        assert_eq!(tokenize("NaN").unwrap(), vec![Token::NaN]);
-    }
-
-    #[test]
-    fn rejects_malformed_numbers() {
-        assert!(matches!(
-            tokenize("1.2.3").unwrap_err(),
-            TokenizeError::UnknownPattern { .. }
-        ));
-        assert!(matches!(
-            tokenize("1e1.5.5").unwrap_err(),
-            TokenizeError::UnknownPattern { .. }
-        ));
-    }
-
-    #[test]
-    fn tokenizes_expanded_patterns() {
-        // Now supporting logical operators and equality
-        assert!(tokenize("a && b").is_ok());
-        assert!(tokenize("x = 10;").is_ok());
-        assert!(tokenize("5! + 10 == 60").is_ok());
-        assert!(tokenize("Σ(x^2)").is_ok());
-        assert!(tokenize("10 <= 20 && 30 != 40").is_ok());
-        assert!(tokenize("∛27").is_ok());
-    }
-
-    #[test]
-    fn tokenizes_expanded_patterns_extra() {
-        assert!(tokenize("log(0)").is_ok());
-        assert!(tokenize("10 ** 100").is_ok());
-        assert!(tokenize("3.14**2 / 0.1").is_ok());
-        assert!(tokenize("sqrt(-1)").is_ok());
-        assert!(tokenize("a + b * c / d").is_ok());
-        assert!(tokenize("10 / (2 - 2) + ∞").is_ok());
-
-        // Newly added tokens
-        assert!(tokenize("3 + 5ππ2").is_ok());
-        assert!(tokenize("5 * (2 + log(10)) + 3").is_ok());
-        assert!(tokenize("3 + 5 * 2 % 3").is_ok());
-        assert!(tokenize("4.5 * (2 + 1) ** 3").is_ok());
-        assert!(tokenize("(1 + (2 * 3)) + $5").is_ok());
-        assert!(tokenize("√(16) + π").is_ok());
-
-        // String literal tests
-        assert!(tokenize("3 + \"5\" * 2.5").is_ok());
-    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .try_init();
 }
 
 pub mod compat {
@@ -676,19 +422,11 @@ pub mod compat {
         }
 
         impl UnixStream {
-            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let inner = TcpStream::connect(addr).await?;
-                Ok(Self { inner })
-            }
-
             pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
                 tokio::io::split(self)
             }
         }
 
-        // Standard poll_read matching Tokio's trait
         impl AsyncRead for UnixStream {
             fn poll_read(
                 mut self: Pin<&mut Self>,

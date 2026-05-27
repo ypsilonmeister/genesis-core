@@ -37,7 +37,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::ai_backend::{
-    build_repair_backend, build_repair_fallback_backend, build_attack_backend, FallbackBackend,
+    build_attack_backend, build_repair_backend, build_repair_fallback_backend, FallbackBackend,
 };
 use crate::attacker::{rand_attack_delay_secs, Attacker};
 use crate::chain::{ChainConfig, ModuleSpec};

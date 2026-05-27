@@ -152,16 +152,16 @@ impl Attacker {
         let phase_examples = examples_parts.join("\n\n");
 
         format!(
-            "あなたは数式パーサーのファジングエージェントです。\
-            以下の計算機システムを壊す入力を生成してください。\n\n\
-            対応済みパターン: {success_str}\n\
-            直近のエラーを引き起こした入力: {errors_str}\n\n\
-            目標: これまでに成功していない新しい失敗パターンを発見する。\
-            同じパターンの繰り返しは避けること。\n\n\
-            解放済み攻撃パターン例 (Phase {phase} まで):\n{phase_examples}\
+            "You are a fuzzing agent for a mathematical expression parser.\
+            Generate inputs that break the following calculator system.\n\n\
+            Handled patterns: {success_str}\n\
+            Inputs that recently caused errors: {errors_str}\n\n\
+            Goal: Discover new failure patterns that haven't been found before.\
+            Avoid repeating the same patterns.\n\n\
+            Unlocked attack pattern examples (up to Phase {phase}):\n{phase_examples}\
             {diversity_hint}\n\n\
-            出力形式: JSON配列のみ。説明不要。1〜5個の入力を生成してください。\n\
-            例: [\"３ + ５\", \"3　+　5\"]",
+            Output format: JSON array only. No explanation needed. Generate 1-5 inputs.\n\
+            Example: [\"3 + 5\", \"3 * 2 + 1\"]",
             success_str = success_str,
             errors_str = errors_str,
             phase = self.phase,

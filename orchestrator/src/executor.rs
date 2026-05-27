@@ -29,8 +29,12 @@ pub trait Executor: Send + Sync {
     fn copy_file(&self, src: &str, dst: &str) -> Result<()>;
     fn create_dir_all(&self, path: &str) -> Result<()>;
     fn remove_dir_all(&self, path: &str) -> Result<()>;
+    async fn kill_child(&self, child: &mut Child) -> Result<()>;
+    async fn spawn_process(&self, binary: &str, socket: &str) -> Result<Child>;
     async fn cargo_build(&self, pkg: &str) -> Result<BuildResult>;
+    async fn cargo_build_repair(&self, pkg: &str) -> Result<BuildResult>;
     async fn cargo_test(&self, pkg: &str) -> Result<bool>;
+    async fn cargo_test_repair(&self, pkg: &str) -> Result<bool>;
     async fn hot_swap(&self, swapper: &HotSwapper, old_child: Child) -> Result<Child>;
 }
 
@@ -61,6 +65,27 @@ impl Executor for SystemExecutor {
         std::fs::remove_dir_all(path).with_context(|| format!("Failed to remove dir {}", path))
     }
 
+    async fn kill_child(&self, child: &mut Child) -> Result<()> {
+        child
+            .kill()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to kill child process: {}", e))?;
+        child
+            .wait()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to wait for child process: {}", e))?;
+        Ok(())
+    }
+
+    async fn spawn_process(&self, binary: &str, socket: &str) -> Result<Child> {
+        tokio::process::Command::new(binary)
+            .arg(socket)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn process {}: {}", binary, e))
+    }
+
     async fn cargo_build(&self, pkg: &str) -> Result<BuildResult> {
         let out = tokio::process::Command::new("cargo")
             .args(["build", "-p", pkg])
@@ -77,12 +102,38 @@ impl Executor for SystemExecutor {
         })
     }
 
+    async fn cargo_build_repair(&self, pkg: &str) -> Result<BuildResult> {
+        let out = tokio::process::Command::new("cargo")
+            .args(["build", "-p", pkg, "--target-dir", "target_repair"])
+            .output()
+            .await
+            .context("Failed to run cargo build (repair)")?;
+        Ok(BuildResult {
+            success: out.status.success(),
+            stderr: if out.status.success() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&out.stderr).to_string())
+            },
+        })
+    }
+
     async fn cargo_test(&self, pkg: &str) -> Result<bool> {
         Ok(tokio::process::Command::new("cargo")
             .args(["test", "-p", pkg])
             .output()
             .await
             .context("Failed to run cargo test")?
+            .status
+            .success())
+    }
+
+    async fn cargo_test_repair(&self, pkg: &str) -> Result<bool> {
+        Ok(tokio::process::Command::new("cargo")
+            .args(["test", "-p", pkg, "--target-dir", "target_repair"])
+            .output()
+            .await
+            .context("Failed to run cargo test (repair)")?
             .status
             .success())
     }

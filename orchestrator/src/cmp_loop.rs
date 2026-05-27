@@ -100,23 +100,26 @@ impl CmpLoop {
         let module_charter = extract_charter(&module_code);
 
         let initial_prompt = format!(
-            "以下のRustモジュールがエラーを繰り返しています。\n\n\
+            "The following Rust module is repeatedly experiencing errors.\n\n\
             Module Charter:\n{module_charter}\n\n\
-            エラーコード: {error_code}\n\
-            発生回数: {error_count}\n\
-            モジュール名: {module_name}\n\n\
-            現在のコード:\n```rust\n{module_code}\n```\n\n\
-            修復案を生成してください。\n\
-            制約:\n\
-            - Module CharterのInvariantsを破らないこと\n\
-            - Module CharterのBoundariesを変更しないこと\n\
-            - 修正範囲は最小限にすること\n\n\
-            出力: 修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。"
+            Error Code: {error_code}\n\
+            Occurrence Count: {error_count}\n\
+            Module Name: {module_name}\n\n\
+            Current Code:\n```rust\n{module_code}\n```\n\n\
+            Generate a repair proposal.\n\
+            Constraints:\n\
+            - Do not violate Module Charter Invariants\n\
+            - Do not modify Module Charter Boundaries\n\
+            - Minimize the scope of changes\n\n\
+            Output: Return the complete fixed Rust code in a ```rust code block. No explanation needed."
         );
 
         info!(module = %module_name, error_code = %error_code, count = error_count,
               "Tier 1: requesting repair from repair AI");
-        let response = self.repair_ai.complete(&initial_prompt).await
+        let response = self
+            .repair_ai
+            .complete(&initial_prompt)
+            .await
             .context("Repair AI failed to generate repair proposal")?;
         info!(module = %module_name, chars = response.len(), "Tier 1: received repair proposal");
 
@@ -133,7 +136,8 @@ impl CmpLoop {
 
         // バックアップは最初の 1 回だけ取る
         let backup_path = format!("{}.bak", module_source_path);
-        self.executor.copy_file(module_source_path, &backup_path)
+        self.executor
+            .copy_file(module_source_path, &backup_path)
             .context("Failed to backup module source")?;
 
         // build/test ループ: 失敗時はエラー内容を渡して修正を依頼する
@@ -144,15 +148,16 @@ impl CmpLoop {
         let mut final_build_error: Option<String> = None;
 
         for attempt in 0..=max_retries {
-            self.executor.write_file(module_source_path, &current_code)
+            self.executor
+                .write_file(module_source_path, &current_code)
                 .context("Failed to write code")?;
 
-            let build_result = self.executor.cargo_build(module_name).await?;
+            let build_result = self.executor.cargo_build_repair(module_name).await?;
             build_ok = build_result.success;
             final_build_error = build_result.stderr.clone();
 
             if build_ok {
-                test_ok = self.executor.cargo_test(module_name).await?;
+                test_ok = self.executor.cargo_test_repair(module_name).await?;
                 if test_ok {
                     break;
                 }
@@ -160,17 +165,19 @@ impl CmpLoop {
 
             if attempt < max_retries {
                 let error_desc = if !build_ok {
-                    format!("ビルドエラー:\n{}",
-                        final_build_error.as_deref().unwrap_or("(不明)"))
+                    format!(
+                        "ビルドエラー:\n{}",
+                        final_build_error.as_deref().unwrap_or("(不明)")
+                    )
                 } else {
                     "テストが失敗しました。".to_string()
                 };
                 let fix_prompt = format!(
-                    "以下のRustコードで{}が発生しました。修正してください。\n\n\
+                    "The following Rust code has a {}. Please fix it.\n\n\
                     {error_desc}\n\n\
-                    コード:\n```rust\n{current_code}\n```\n\n\
-                    修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。",
-                    if build_ok { "テスト失敗" } else { "ビルドエラー" }
+                    Code:\n```rust\n{current_code}\n```\n\n\
+                    Return the complete fixed Rust code in a ```rust code block. No explanation needed.",
+                    if build_ok { "test failure" } else { "build error" }
                 );
                 info!(module = %module_name, attempt = attempt + 1, max = max_retries,
                       "Tier 1: requesting fix from repair AI");
@@ -181,10 +188,15 @@ impl CmpLoop {
 
         if !build_ok || !test_ok {
             warn!(module = %module_name, "Tier 1: build/test failed after all retries, restoring backup");
-            self.executor.copy_file(&backup_path, module_source_path)
+            self.executor
+                .copy_file(&backup_path, module_source_path)
                 .context("Failed to restore backup")?;
 
-            let rejection_reason = if build_ok { "tests failed" } else { "build failed" };
+            let rejection_reason = if build_ok {
+                "tests failed"
+            } else {
+                "build failed"
+            };
             let rec = ModificationRecord {
                 timestamp: Utc::now().to_rfc3339(),
                 tier: 1,
@@ -196,19 +208,53 @@ impl CmpLoop {
                 generated_code: Some(current_code),
                 build_result: if build_ok { "success" } else { "failure" }.to_string(),
                 build_error: final_build_error,
-                test_result: if build_ok { Some("fail".to_string()) } else { None },
+                test_result: if build_ok {
+                    Some("fail".to_string())
+                } else {
+                    None
+                },
                 decision: "rejected".to_string(),
                 rejection_reason: Some(rejection_reason.to_string()),
                 adopted_at: None,
             };
             metadata.insert_modification(&rec)?;
-            return Ok((RepairOutcome::Rejected { reason: rejection_reason.to_string() }, old_child));
+            return Ok((
+                RepairOutcome::Rejected {
+                    reason: rejection_reason.to_string(),
+                },
+                old_child,
+            ));
         }
 
-        info!(module = %module_name, "Tier 1: build+test passed, initiating hot_swap");
+        info!(module = %module_name, "Tier 1: build+test passed, preparing binary swap");
+        // Kill old process to release the binary file lock on Windows before copying
+        let mut old_child_mut = old_child;
+        self.executor
+            .kill_child(&mut old_child_mut)
+            .await
+            .context("Failed to kill old process before copying repair binary")?;
+
+        // Copy the tested repair binary from target_repair to the final location
+        let repair_binary_path = format!("target_repair/debug/{}{}",
+            module_name,
+            if cfg!(windows) { ".exe" } else { "" }
+        );
+        let final_binary_path = format!("target/debug/{}{}",
+            module_name,
+            if cfg!(windows) { ".exe" } else { "" }
+        );
+        self.executor
+            .copy_file(&repair_binary_path, &final_binary_path)
+            .context("Failed to copy repair binary to final location")?;
+
+        info!(module = %module_name, "Tier 1: starting new process");
+        let new_child = self.executor
+            .spawn_process(&hot_swapper.binary_path, &hot_swapper.socket_path)
+            .await
+            .context("Failed to spawn new module process")?;
+
+        info!(module = %module_name, "Tier 1: new process spawned");
         let adopted_at = Utc::now().to_rfc3339();
-        let new_child = self.executor.hot_swap(hot_swapper, old_child).await
-            .context("hot_swap failed")?;
 
         let rec = ModificationRecord {
             timestamp: Utc::now().to_rfc3339(),
@@ -270,15 +316,15 @@ impl CmpLoop {
         let charters_str = charters.join("\n\n");
 
         let judge_prompt = format!(
-            "計算機が以下のパターンをどのモジュールでも処理できません。\n\n\
-            未知パターン例: {examples}\n\
-            現在のモジュールチェーン: {chain_desc}\n\n\
-            各 Module Charter:\n{charters_str}\n\n\
-            判定してください:\n\
-            A) 既存モジュール (normalizer か tokenizer) の拡張で対応できる\n\
-            B) 新しいモジュールが必要\n\n\
-            回答形式: JSON のみ (説明不要)\n\
-            {{\"approach\": \"extend\" | \"new\", \"target_module\": \"モジュール名\", \"reason\": \"理由\"}}"
+            "The calculator cannot process the following patterns in any module.\n\n\
+            Unknown pattern examples: {examples}\n\
+            Current module chain: {chain_desc}\n\n\
+            Module Charters:\n{charters_str}\n\n\
+            Make a judgment:\n\
+            A) Can be handled by extending existing modules (normalizer or tokenizer)\n\
+            B) A new module is needed\n\n\
+            Response format: JSON only (no explanation needed)\n\
+            {{\"approach\": \"extend\" | \"new\", \"target_module\": \"module_name\", \"reason\": \"reason\"}}"
         );
 
         info!("Tier 2: requesting judgment from repair AI");
@@ -299,7 +345,12 @@ impl CmpLoop {
             .iter()
             .find(|n| raw_target == n.as_str() || raw_target.contains(n.as_str()))
             .map(|n| n.as_str())
-            .unwrap_or_else(|| chain_module_names.first().map(|s| s.as_str()).unwrap_or("normalizer"));
+            .unwrap_or_else(|| {
+                chain_module_names
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("normalizer")
+            });
         let reason = judgment["reason"].as_str().unwrap_or("").to_string();
         info!(approach, target, reason = %reason, "Tier 2: judgment received");
 
@@ -317,14 +368,14 @@ impl CmpLoop {
             let module_charter = extract_charter(&module_code);
 
             let repair_prompt = format!(
-                "以下のモジュールを拡張して UNKNOWN_PATTERN エラーに対応してください。\n\n\
-                未知パターン例: {examples}\n\n\
+                "Extend the following module to handle UNKNOWN_PATTERN errors.\n\n\
+                Unknown pattern examples: {examples}\n\n\
                 Module Charter:\n{module_charter}\n\n\
-                現在のコード:\n```rust\n{module_code}\n```\n\n\
-                制約:\n\
-                - Module CharterのInvariantsを破らないこと\n\
-                - 修正範囲は最小限にすること\n\n\
-                出力: 修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。"
+                Current Code:\n```rust\n{module_code}\n```\n\n\
+                Constraints:\n\
+                - Do not violate Module Charter Invariants\n\
+                - Minimize the scope of changes\n\n\
+                Output: Return the complete fixed Rust code in a ```rust code block. No explanation needed."
             );
 
             let repair_code = self.repair_ai.complete(&repair_prompt).await?;
@@ -354,12 +405,12 @@ impl CmpLoop {
             for attempt in 0..=max_retries {
                 self.executor.write_file(source_path, &current_code)?;
 
-                let build_result = self.executor.cargo_build(target).await?;
+                let build_result = self.executor.cargo_build_repair(target).await?;
                 build_ok = build_result.success;
                 final_build_error = build_result.stderr.clone();
 
                 if build_ok {
-                    test_ok = self.executor.cargo_test(target).await?;
+                    test_ok = self.executor.cargo_test_repair(target).await?;
                     if test_ok {
                         break;
                     }
@@ -367,20 +418,26 @@ impl CmpLoop {
 
                 if attempt < max_retries {
                     let error_desc = if !build_ok {
-                        format!("ビルドエラー:\n{}",
-                            final_build_error.as_deref().unwrap_or("(不明)"))
+                        format!(
+                            "Build Error:\n{}",
+                            final_build_error.as_deref().unwrap_or("(unknown)")
+                        )
                     } else {
-                        "テストが失敗しました。".to_string()
+                        "Test failed.".to_string()
                     };
                     let fix_prompt = format!(
-                        "以下のRustコードで{}が発生しました。修正してください。\n\n\
+                        "The following Rust code has a {}. Please fix it.\n\n\
                         {error_desc}\n\n\
-                        コード:\n```rust\n{current_code}\n```\n\n\
-                        修正後のRustコード全体を ```rust ブロックで出力してください。説明文は不要です。",
-                        if build_ok { "テスト失敗" } else { "ビルドエラー" }
+                        Code:\n```rust\n{current_code}\n```\n\n\
+                        Return the complete fixed Rust code in a ```rust code block. No explanation needed.",
+                        if build_ok { "test failure" } else { "build error" }
                     );
-                    info!(target, attempt = attempt + 1, max = max_retries,
-                          "Tier 2: requesting fix from repair AI");
+                    info!(
+                        target,
+                        attempt = attempt + 1,
+                        max = max_retries,
+                        "Tier 2: requesting fix from repair AI"
+                    );
                     let fix_response = self.repair_ai.complete(&fix_prompt).await?;
                     current_code = strip_code_fence(&fix_response);
                 }
@@ -388,7 +445,11 @@ impl CmpLoop {
 
             if !build_ok || !test_ok {
                 self.executor.copy_file(&backup, source_path)?;
-                let rejection_reason = if build_ok { "tests failed" } else { "build failed" };
+                let rejection_reason = if build_ok {
+                    "tests failed"
+                } else {
+                    "build failed"
+                };
                 let rec = ModificationRecord {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     tier: 2,
@@ -400,7 +461,11 @@ impl CmpLoop {
                     generated_code: Some(current_code),
                     build_result: if build_ok { "success" } else { "failure" }.to_string(),
                     build_error: final_build_error,
-                    test_result: if build_ok { Some("fail".to_string()) } else { None },
+                    test_result: if build_ok {
+                        Some("fail".to_string())
+                    } else {
+                        None
+                    },
                     decision: "rejected".to_string(),
                     rejection_reason: Some(rejection_reason.to_string()),
                     adopted_at: None,
@@ -434,27 +499,25 @@ impl CmpLoop {
                 module_name: target.to_string(),
             })
         } else {
-            // --- 新モジュール追加パス ---
+            // --- New module addition path ---
             let new_mod_prompt = format!(
-                "新しいRustモジュールを生成してください。\n\n\
-                目的: 以下の未知パターンを処理できるモジュールを追加する\n\
-                未知パターン例: {examples}\n\n\
-                現在のチェーン: {chain_desc}\n\n\
-                要件:\n\
-                - モジュールは UDS (Unix Domain Socket) 経由で JSON を受け取り返す\n\
-                - 既存モジュール (modules/normalizer) の通信プロトコルと同一形式\n\
-                - CMP Module Charter コメントを冒頭に書く\n\
-                - 出力サイズ制限（トークン切れ）を防ぐため、コードおよび Cargo.toml は極めて簡潔かつ最小限に実装してください。\n\
-                - Cargo.toml の dependencies は、必要最小限の依存関係 (tokio, serde, serde_json, thiserror, anyhow, tracing) のみに限定し、不要なパッケージを含めないでください。\n\n\
-                出力形式: JSON のみ (説明不要)\n\
-                重要: \"cargo_toml\" や \"main_rs\" などの複数行のソースコードを JSON 内に埋め込む際、\n\
-                改行は \\n に、ダブルクォーテーション「\"」は \\\" に、バックスラッシュ「\\」は \\\\ に、\n\
-                規格に従って正しくエスケープしてください。有効な JSON 文字列を出力してください。\n\
+                "Generate a new Rust module.\n\n\
+                Purpose: Add a module that can handle the following unknown patterns.\n\
+                Unknown pattern examples: {examples}\n\n\
+                Current module chain: {chain_desc}\n\n\
+                Requirements:\n\
+                - Module must receive and return JSON over UDS (Unix Domain Socket)\n\
+                - Use the same communication protocol as existing modules (modules/normalizer)\n\
+                - Include CMP Module Charter comment at the top\n\
+                - Keep code and Cargo.toml extremely concise and minimal to prevent token overflow.\n\
+                - Limit Cargo.toml dependencies to only necessary ones (tokio, serde, serde_json, thiserror, anyhow, tracing). Do not include unnecessary packages.\n\n\
+                Output format: JSON only (no explanation needed)\n\
+                IMPORTANT: When embedding multi-line source code like \"cargo_toml\" and \"main_rs\" in JSON, properly escape: newlines as \\n, double quotes as \\\", backslashes as \\\\. Output valid JSON.\n\
                 {{\n\
-                  \"name\": \"モジュール名 (snake_case)\",\n\
-                  \"insert_after\": \"チェーン内の挿入位置 (どのモジュールの後か)\",\n\
-                  \"cargo_toml\": \"Cargo.toml の全文\",\n\
-                  \"main_rs\": \"src/main.rs の全文\"\n\
+                  \"name\": \"module_name (snake_case)\",\n\
+                  \"insert_after\": \"position in chain (which module to insert after)\",\n\
+                  \"cargo_toml\": \"full Cargo.toml content\",\n\
+                  \"main_rs\": \"full src/main.rs content\"\n\
                 }}"
             );
 
@@ -482,8 +545,8 @@ impl CmpLoop {
                         attempts += 1;
                         if attempts < 2 {
                             current_prompt = format!(
-                                "{}\n\n前回の出力は以下のパースエラーになりました:\n{}\n\n\
-                                上記のエラーを修正し、正しくエスケープされた有効な JSON のみを出力してください。",
+                                "{}\n\nYour previous output had the following parse error:\n{}\n\n\
+                                Fix the above error and output only properly escaped, valid JSON.",
                                 new_mod_prompt,
                                 e
                             );
@@ -492,21 +555,44 @@ impl CmpLoop {
                 }
             }
 
-            let new_mod = new_mod.context("Failed to parse new module spec after retries")?;
+            let new_mod = match new_mod {
+                Some(m) => m,
+                None => {
+                    warn!("Tier 2: new module generation failed after retries, skipping");
+                    return Ok(Tier2Outcome::Rejected {
+                        reason: "failed to generate valid module JSON".to_string(),
+                    });
+                }
+            };
 
-            let mod_name = new_mod["name"]
-                .as_str()
-                .context("missing name")?
-                .to_string();
+            let mod_name = match new_mod["name"].as_str() {
+                Some(n) => n.to_string(),
+                None => {
+                    warn!("Tier 2: missing module name in generated JSON");
+                    return Ok(Tier2Outcome::Rejected {
+                        reason: "missing name in module spec".to_string(),
+                    });
+                }
+            };
             let insert_after = new_mod["insert_after"].as_str().map(|s| s.to_string());
-            let cargo_toml = new_mod["cargo_toml"]
-                .as_str()
-                .context("missing cargo_toml")?
-                .to_string();
-            let main_rs = new_mod["main_rs"]
-                .as_str()
-                .context("missing main_rs")?
-                .to_string();
+            let cargo_toml = match new_mod["cargo_toml"].as_str() {
+                Some(ct) => ct.to_string(),
+                None => {
+                    warn!("Tier 2: missing cargo_toml in generated JSON");
+                    return Ok(Tier2Outcome::Rejected {
+                        reason: "missing cargo_toml in module spec".to_string(),
+                    });
+                }
+            };
+            let main_rs = match new_mod["main_rs"].as_str() {
+                Some(mr) => mr.to_string(),
+                None => {
+                    warn!("Tier 2: missing main_rs in generated JSON");
+                    return Ok(Tier2Outcome::Rejected {
+                        reason: "missing main_rs in module spec".to_string(),
+                    });
+                }
+            };
 
             info!(mod_name = %mod_name, "Tier 2: creating new module");
 
@@ -824,8 +910,17 @@ fn strip_code_fence(s: &str) -> String {
     // 2. コードフェンスがない場合: Rust コードらしい行頭を探してそこ以降を返す。
     //    Claude がコードブロックなしで説明文 + コードを出力した場合のフォールバック。
     const RUST_MARKERS: &[&str] = &[
-        "// # CMP", "// CMP", "use ", "pub use ", "pub fn ", "pub struct ",
-        "pub enum ", "fn main", "#[derive", "#![", "mod ",
+        "// # CMP",
+        "// CMP",
+        "use ",
+        "pub use ",
+        "pub fn ",
+        "pub struct ",
+        "pub enum ",
+        "fn main",
+        "#[derive",
+        "#![",
+        "mod ",
     ];
     for marker in RUST_MARKERS {
         // 行頭にあるか確認 (pos==0 または直前が改行)
@@ -903,13 +998,35 @@ mod tests {
         fn remove_dir_all(&self, _path: &str) -> Result<()> {
             Ok(())
         }
+        async fn kill_child(&self, child: &mut Child) -> Result<()> {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Ok(())
+        }
+        async fn spawn_process(&self, _binary: &str, _socket: &str) -> Result<Child> {
+            #[cfg(windows)]
+            return Ok(tokio::process::Command::new("cmd")
+                .args(["/c", "exit", "0"])
+                .spawn()?);
+            #[cfg(not(windows))]
+            return Ok(tokio::process::Command::new("true").spawn()?);
+        }
         async fn cargo_build(&self, _pkg: &str) -> Result<crate::executor::BuildResult> {
             Ok(crate::executor::BuildResult {
                 success: self.build_ok,
                 stderr: None,
             })
         }
+        async fn cargo_build_repair(&self, _pkg: &str) -> Result<crate::executor::BuildResult> {
+            Ok(crate::executor::BuildResult {
+                success: self.build_ok,
+                stderr: None,
+            })
+        }
         async fn cargo_test(&self, _pkg: &str) -> Result<bool> {
+            Ok(self.test_ok)
+        }
+        async fn cargo_test_repair(&self, _pkg: &str) -> Result<bool> {
             Ok(self.test_ok)
         }
         async fn hot_swap(&self, _swapper: &HotSwapper, mut old: Child) -> Result<Child> {
@@ -927,10 +1044,15 @@ mod tests {
     }
 
     async fn dummy_child() -> Child {
-        tokio::process::Command::new("sleep")
-            .arg("9999")
+        #[cfg(windows)]
+        return tokio::process::Command::new("cmd")
+            .args(["/c", "exit", "0"])
             .spawn()
-            .expect("sleep must exist on this platform")
+            .expect("cmd must exist on Windows");
+        #[cfg(not(windows))]
+        return tokio::process::Command::new("true")
+            .spawn()
+            .expect("true must exist");
     }
 
     fn make_metadata() -> MetadataStore {
@@ -1183,6 +1305,19 @@ mod tests {
                 .push(Op::RemoveDirAll(path.to_string()));
             Ok(())
         }
+        async fn kill_child(&self, child: &mut Child) -> Result<()> {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Ok(())
+        }
+        async fn spawn_process(&self, _binary: &str, _socket: &str) -> Result<Child> {
+            #[cfg(windows)]
+            return Ok(tokio::process::Command::new("cmd")
+                .args(["/c", "exit", "0"])
+                .spawn()?);
+            #[cfg(not(windows))]
+            return Ok(tokio::process::Command::new("true").spawn()?);
+        }
         async fn cargo_build(&self, pkg: &str) -> Result<crate::executor::BuildResult> {
             self.ops
                 .lock()
@@ -1197,11 +1332,32 @@ mod tests {
                 },
             })
         }
+        async fn cargo_build_repair(&self, pkg: &str) -> Result<crate::executor::BuildResult> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::CargoBuild(format!("{} (repair)", pkg)));
+            Ok(crate::executor::BuildResult {
+                success: self.build_ok,
+                stderr: if self.build_ok {
+                    None
+                } else {
+                    Some("fake build error".to_string())
+                },
+            })
+        }
         async fn cargo_test(&self, pkg: &str) -> Result<bool> {
             self.ops
                 .lock()
                 .unwrap()
                 .push(Op::CargoTest(pkg.to_string()));
+            Ok(self.test_ok)
+        }
+        async fn cargo_test_repair(&self, pkg: &str) -> Result<bool> {
+            self.ops
+                .lock()
+                .unwrap()
+                .push(Op::CargoTest(format!("{} (repair)", pkg)));
             Ok(self.test_ok)
         }
         async fn hot_swap(&self, _swapper: &HotSwapper, mut old: Child) -> Result<Child> {
@@ -1288,13 +1444,13 @@ mod tests {
             recorded
         );
         assert!(
-            recorded.contains(&Op::CargoBuild("normalizer".to_string())),
-            "CargoBuild(normalizer) must be recorded; ops={:?}",
+            recorded.iter().any(|o| matches!(o, Op::CargoBuild(s) if s == "normalizer (repair)")),
+            "CargoBuild(normalizer (repair)) must be recorded; ops={:?}",
             recorded
         );
         assert!(
-            recorded.contains(&Op::CargoTest("normalizer".to_string())),
-            "CargoTest(normalizer) must be recorded; ops={:?}",
+            recorded.iter().any(|o| matches!(o, Op::CargoTest(s) if s == "normalizer (repair)")),
+            "CargoTest(normalizer (repair)) must be recorded; ops={:?}",
             recorded
         );
     }
@@ -1311,7 +1467,10 @@ mod tests {
             // 修正ループ (FIX_RETRY_COUNT=2) で合計 2 回 fix 呼び出しが発生するため
             // JUDGE + initial + fix×2 = 4 レスポンスを用意する
             Box::new(SequencedAi::new([
-                JUDGE_EXTEND, "broken code", "still broken 1", "still broken 2",
+                JUDGE_EXTEND,
+                "broken code",
+                "still broken 1",
+                "still broken 2",
             ])),
             Box::new(TrackingExecutor {
                 build_ok: false,
@@ -1366,7 +1525,10 @@ mod tests {
             // 修正ループ (FIX_RETRY_COUNT=2) で合計 2 回 fix 呼び出しが発生するため
             // JUDGE + initial + fix×2 = 4 レスポンスを用意する
             Box::new(SequencedAi::new([
-                JUDGE_EXTEND, "fn ok() {}", "fn ok() {} // fix1", "fn ok() {} // fix2",
+                JUDGE_EXTEND,
+                "fn ok() {}",
+                "fn ok() {} // fix1",
+                "fn ok() {} // fix2",
             ])),
             Box::new(TrackingExecutor {
                 build_ok: true,
@@ -1394,13 +1556,13 @@ mod tests {
         );
         let recorded = ops.lock().unwrap().clone();
         assert!(
-            recorded.contains(&Op::CargoBuild("normalizer".to_string())),
-            "CargoBuild must be recorded; ops={:?}",
+            recorded.iter().any(|o| matches!(o, Op::CargoBuild(s) if s == "normalizer (repair)")),
+            "CargoBuild(normalizer (repair)) must be recorded; ops={:?}",
             recorded
         );
         assert!(
-            recorded.contains(&Op::CargoTest("normalizer".to_string())),
-            "CargoTest must be recorded even on failure; ops={:?}",
+            recorded.iter().any(|o| matches!(o, Op::CargoTest(s) if s == "normalizer (repair)")),
+            "CargoTest(normalizer (repair)) must be recorded even on failure; ops={:?}",
             recorded
         );
         let copy_count = recorded

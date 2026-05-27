@@ -25,11 +25,11 @@
 // v1 実装範囲:
 //   連続空白を単一空白に圧縮、前後空白をトリム。それ以外は素通し。
 
+use crate::compat::UnixListener;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     tracing::info!("Listening on {}", socket_path);
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
         tokio::spawn(async move {
             let (reader, mut writer) = stream.split();
             let mut reader = tokio::io::BufReader::new(reader);
@@ -157,5 +157,104 @@ mod tests {
         // Charter: 空文字列を受け取った場合はエラーを返す
         assert!(normalize("").is_err());
         assert!(normalize("   ").is_err());
+    }
+}
+
+pub mod compat {
+    #[cfg(windows)]
+    pub use windows::*;
+
+    #[cfg(unix)]
+    pub use tokio::net::{UnixListener, UnixStream};
+
+    #[cfg(windows)]
+    mod windows {
+        use std::net::SocketAddr;
+        use std::path::Path;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use tokio::net::{TcpListener, TcpStream};
+
+        fn path_to_port(path: impl AsRef<Path>) -> u16 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            path.as_ref().to_string_lossy().hash(&mut hasher);
+            let hash = hasher.finish();
+            (49152 + (hash % 16384)) as u16
+        }
+
+        pub struct UnixListener {
+            inner: TcpListener,
+        }
+
+        impl UnixListener {
+            pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
+                let port = path_to_port(path);
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let std_listener = std::net::TcpListener::bind(addr)?;
+                std_listener.set_nonblocking(true)?;
+                let inner = TcpListener::from_std(std_listener)?;
+                Ok(Self { inner })
+            }
+
+            pub async fn accept(&self) -> std::io::Result<(UnixStream, SocketAddr)> {
+                let (stream, addr) = self.inner.accept().await?;
+                Ok((UnixStream { inner: stream }, addr))
+            }
+        }
+
+        pub struct UnixStream {
+            inner: TcpStream,
+        }
+
+        impl UnixStream {
+            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
+                let port = path_to_port(path);
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let inner = TcpStream::connect(addr).await?;
+                Ok(Self { inner })
+            }
+
+            pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
+                tokio::io::split(self)
+            }
+        }
+
+        // Standard poll_read matching Tokio's trait
+        impl AsyncRead for UnixStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for UnixStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
     }
 }

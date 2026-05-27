@@ -52,7 +52,7 @@ pub struct ModuleError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Token {
     Number(f64),
     Plus,
@@ -77,7 +77,7 @@ pub enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Expr {
     Number(f64),
     BinOp {
@@ -93,6 +93,11 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    Ternary {
+        cond: Box<Expr>,
+        truthy: Box<Expr>,
+        falsy: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +108,10 @@ pub enum BinOp {
     Mul,
     Div,
     Pow,
+    LShift,
+    Gt,
+    Lt,
+    DotDot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +144,85 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_add_sub()
+        self.parse_ternary()
+    }
+
+    fn parse_ternary(&mut self) -> Result<Expr, String> {
+        let node = self.parse_range()?;
+        if let Some(Token::Question) = self.peek() {
+            self.next();
+            let truthy = self.parse_expression()?;
+            if let Some(Token::Colon) = self.peek() {
+                self.next();
+                let falsy = self.parse_ternary()?; // Right associative
+                return Ok(Expr::Ternary {
+                    cond: Box::new(node),
+                    truthy: Box::new(truthy),
+                    falsy: Box::new(falsy),
+                });
+            } else {
+                return Err("Expected ':' in ternary operator".to_string());
+            }
+        }
+        Ok(node)
+    }
+
+    fn parse_range(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_relational()?;
+        // Enforce no operator sequences for range
+        if let Some(Token::DotDot) = self.peek() {
+            self.next();
+            let rhs = self.parse_relational()?;
+            node = Expr::BinOp {
+                op: BinOp::DotDot,
+                lhs: Box::new(node),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(node)
+    }
+
+    fn parse_relational(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_shift()?;
+        // Enforce no operator sequences for relational operators
+        if let Some(t) = self.peek().cloned() {
+            match t {
+                Token::Gt => {
+                    self.next();
+                    let rhs = self.parse_shift()?;
+                    node = Expr::BinOp {
+                        op: BinOp::Gt,
+                        lhs: Box::new(node),
+                        rhs: Box::new(rhs),
+                    };
+                }
+                Token::Lt => {
+                    self.next();
+                    let rhs = self.parse_shift()?;
+                    node = Expr::BinOp {
+                        op: BinOp::Lt,
+                        lhs: Box::new(node),
+                        rhs: Box::new(rhs),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Ok(node)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_add_sub()?;
+        while let Some(Token::LShift) = self.peek() {
+            self.next();
+            let rhs = self.parse_add_sub()?;
+            node = Expr::BinOp {
+                op: BinOp::LShift,
+                lhs: Box::new(node),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(node)
     }
 
     fn parse_add_sub(&mut self) -> Result<Expr, String> {
@@ -167,12 +254,12 @@ impl Parser {
     }
 
     fn parse_mul_div(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_pow()?;
+        let mut node = self.parse_unary()?;
         while let Some(t) = self.peek() {
             match t {
                 Token::Star => {
                     self.next();
-                    let rhs = self.parse_pow()?;
+                    let rhs = self.parse_unary()?;
                     node = Expr::BinOp {
                         op: BinOp::Mul,
                         lhs: Box::new(node),
@@ -181,7 +268,7 @@ impl Parser {
                 }
                 Token::Slash => {
                     self.next();
-                    let rhs = self.parse_pow()?;
+                    let rhs = self.parse_unary()?;
                     node = Expr::BinOp {
                         op: BinOp::Div,
                         lhs: Box::new(node),
@@ -194,8 +281,38 @@ impl Parser {
         Ok(node)
     }
 
+    fn parse_unary(&mut self) -> Result<Expr, String> {
+        match self.peek() {
+            Some(Token::Minus) => {
+                self.next();
+                let expr = self.parse_pow()?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(expr),
+                })
+            }
+            Some(Token::Sqrt) => {
+                self.next();
+                let expr = self.parse_pow()?;
+                Ok(Expr::FunctionCall {
+                    name: "sqrt".to_string(),
+                    args: vec![expr],
+                })
+            }
+            Some(Token::Cbrt) => {
+                self.next();
+                let expr = self.parse_pow()?;
+                Ok(Expr::FunctionCall {
+                    name: "cbrt".to_string(),
+                    args: vec![expr],
+                })
+            }
+            _ => self.parse_pow(),
+        }
+    }
+
     fn parse_pow(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_unary()?;
+        let mut node = self.parse_postfix()?;
         if let Some(Token::Caret) = self.peek() {
             self.next();
             let rhs = self.parse_pow()?; // Right associative
@@ -206,40 +323,6 @@ impl Parser {
             };
         }
         Ok(node)
-    }
-
-    fn parse_unary(&mut self) -> Result<Expr, String> {
-        match self.peek() {
-            Some(Token::Minus) => {
-                self.next();
-                let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Neg,
-                    expr: Box::new(expr),
-                })
-            }
-            Some(Token::Plus) => {
-                self.next();
-                self.parse_unary()
-            }
-            Some(Token::Sqrt) => {
-                self.next();
-                let expr = self.parse_unary()?;
-                Ok(Expr::FunctionCall {
-                    name: "sqrt".to_string(),
-                    args: vec![expr],
-                })
-            }
-            Some(Token::Cbrt) => {
-                self.next();
-                let expr = self.parse_unary()?;
-                Ok(Expr::FunctionCall {
-                    name: "cbrt".to_string(),
-                    args: vec![expr],
-                })
-            }
-            _ => self.parse_postfix(),
-        }
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
@@ -268,38 +351,54 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
-        let t = self.next().ok_or("Unexpected end of input")?;
+        let t = self.peek().cloned();
         match t {
-            Token::Number(n) => Ok(Expr::Number(n)),
-            Token::LParen => {
+            Some(Token::Number(n)) => {
+                self.next();
+                Ok(Expr::Number(n))
+            }
+            Some(Token::LParen) => {
+                self.next();
                 let node = self.parse_expression()?;
-                if let Some(Token::RParen) = self.next() {
-                    Ok(node)
-                } else {
-                    Err("Missing closing parenthesis".to_string())
+                match self.peek() {
+                    Some(Token::RParen) => {
+                        self.next();
+                        Ok(node)
+                    }
+                    _ => Err("Missing closing parenthesis".to_string()),
                 }
             }
-            Token::Function(name) => {
-                if let Some(Token::LParen) = self.next() {
-                    let mut args = Vec::new();
-                    if let Some(Token::RParen) = self.peek() {
+            Some(Token::Function(name)) => {
+                self.next();
+                match self.peek() {
+                    Some(Token::LParen) => {
                         self.next();
-                    } else {
-                        loop {
-                            args.push(self.parse_expression()?);
-                            match self.next() {
-                                Some(Token::Comma) => continue,
-                                Some(Token::RParen) => break,
-                                _ => return Err("Invalid function call syntax".to_string()),
+                        let mut args = Vec::new();
+                        if let Some(Token::RParen) = self.peek() {
+                            self.next();
+                        } else {
+                            loop {
+                                args.push(self.parse_expression()?);
+                                match self.peek() {
+                                    Some(Token::Comma) => {
+                                        self.next();
+                                        continue;
+                                    }
+                                    Some(Token::RParen) => {
+                                        self.next();
+                                        break;
+                                    }
+                                    _ => return Err("Invalid function call syntax".to_string()),
+                                }
                             }
                         }
+                        Ok(Expr::FunctionCall { name, args })
                     }
-                    Ok(Expr::FunctionCall { name, args })
-                } else {
-                    Err("Expected '(' after function name".to_string())
+                    _ => Err("Expected '(' after function name".to_string()),
                 }
             }
-            _ => Err(format!("Unexpected token: {:?}", t)),
+            Some(tok) => Err(format!("Unexpected token: {:?}", tok)),
+            None => Err("Unexpected end of input".to_string()),
         }
     }
 }
@@ -416,14 +515,21 @@ where
                     }
                 }
             }
-            Err(e) => (
-                None,
-                Some(ModuleError {
-                    code: "SYNTAX_ERROR".to_string(),
-                    message: e,
-                    input_position: Some(parser.pos),
-                }),
-            ),
+            Err(e) => {
+                let pos = if parser.pos < parser.tokens.len() {
+                    Some(parser.pos)
+                } else {
+                    None
+                };
+                (
+                    None,
+                    Some(ModuleError {
+                        code: "SYNTAX_ERROR".to_string(),
+                        message: e,
+                        input_position: pos,
+                    }),
+                )
+            }
         };
 
         let response = ModuleResponse {
@@ -594,7 +700,6 @@ pub mod compat {
             }
         }
 
-        // Standard poll_read matching Tokio's trait
         impl AsyncRead for UnixStream {
             fn poll_read(
                 mut self: Pin<&mut Self>,
