@@ -59,20 +59,25 @@ impl Default for ClaudeCli {
 #[async_trait]
 impl AiBackend for ClaudeCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let temp_file =
-            std::env::temp_dir().join(format!("claude_prompt_{}.txt", uuid::Uuid::new_v4()));
+        let mut child = create_command(&self.binary)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn '{}'", self.binary))?;
 
-        tokio::fs::write(&temp_file, prompt)
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("Failed to write prompt to stdin")?;
+        }
+
+        let output = child
+            .wait_with_output()
             .await
-            .context("Failed to write prompt to temp file")?;
-
-        let output = create_command(&self.binary)
-            .args(["-f", temp_file.to_str().unwrap_or("")])
-            .output()
-            .await
-            .with_context(|| format!("Failed to run '{}'", self.binary))?;
-
-        let _ = tokio::fs::remove_file(&temp_file).await;
+            .context("Failed to wait for command")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -104,20 +109,26 @@ impl Default for GeminiCli {
 #[async_trait]
 impl AiBackend for GeminiCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let temp_file =
-            std::env::temp_dir().join(format!("gemini_prompt_{}.txt", uuid::Uuid::new_v4()));
+        let mut child = create_command(&self.binary)
+            .arg("-y")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn '{}'", self.binary))?;
 
-        tokio::fs::write(&temp_file, prompt)
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("Failed to write prompt to stdin")?;
+        }
+
+        let output = child
+            .wait_with_output()
             .await
-            .context("Failed to write prompt to temp file")?;
-
-        let output = create_command(&self.binary)
-            .args(["-f", temp_file.to_str().unwrap_or(""), "-y"])
-            .output()
-            .await
-            .with_context(|| format!("Failed to run '{}'", self.binary))?;
-
-        let _ = tokio::fs::remove_file(&temp_file).await;
+            .context("Failed to wait for command")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -149,24 +160,26 @@ impl Default for AgyCli {
 #[async_trait]
 impl AiBackend for AgyCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let temp_file =
-            std::env::temp_dir().join(format!("agy_prompt_{}.txt", uuid::Uuid::new_v4()));
+        let mut child = create_command(&self.binary)
+            .arg("--dangerously-skip-permissions")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("Failed to spawn '{}'", self.binary))?;
 
-        tokio::fs::write(&temp_file, prompt)
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .context("Failed to write prompt to stdin")?;
+        }
+
+        let output = child
+            .wait_with_output()
             .await
-            .context("Failed to write prompt to temp file")?;
-
-        let output = create_command(&self.binary)
-            .args([
-                "-f",
-                temp_file.to_str().unwrap_or(""),
-                "--dangerously-skip-permissions",
-            ])
-            .output()
-            .await
-            .with_context(|| format!("Failed to run '{}'", self.binary))?;
-
-        let _ = tokio::fs::remove_file(&temp_file).await;
+            .context("Failed to wait for command")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
