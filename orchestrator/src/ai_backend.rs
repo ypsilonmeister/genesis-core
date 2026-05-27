@@ -22,6 +22,19 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::warn;
 
+fn create_command(binary: &str) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg(binary);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        tokio::process::Command::new(binary)
+    }
+}
+
 #[async_trait]
 pub trait AiBackend: Send + Sync {
     async fn complete(&self, prompt: &str) -> Result<String>;
@@ -46,11 +59,20 @@ impl Default for ClaudeCli {
 #[async_trait]
 impl AiBackend for ClaudeCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let output = tokio::process::Command::new(&self.binary)
-            .args(["-p", prompt])
+        let temp_file =
+            std::env::temp_dir().join(format!("claude_prompt_{}.txt", uuid::Uuid::new_v4()));
+
+        tokio::fs::write(&temp_file, prompt)
+            .await
+            .context("Failed to write prompt to temp file")?;
+
+        let output = create_command(&self.binary)
+            .args(["-f", temp_file.to_str().unwrap_or("")])
             .output()
             .await
             .with_context(|| format!("Failed to run '{}'", self.binary))?;
+
+        let _ = tokio::fs::remove_file(&temp_file).await;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -82,11 +104,20 @@ impl Default for GeminiCli {
 #[async_trait]
 impl AiBackend for GeminiCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let output = tokio::process::Command::new(&self.binary)
-            .args(["-p", prompt, "-y"])
+        let temp_file =
+            std::env::temp_dir().join(format!("gemini_prompt_{}.txt", uuid::Uuid::new_v4()));
+
+        tokio::fs::write(&temp_file, prompt)
+            .await
+            .context("Failed to write prompt to temp file")?;
+
+        let output = create_command(&self.binary)
+            .args(["-f", temp_file.to_str().unwrap_or(""), "-y"])
             .output()
             .await
             .with_context(|| format!("Failed to run '{}'", self.binary))?;
+
+        let _ = tokio::fs::remove_file(&temp_file).await;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,19 +149,28 @@ impl Default for AgyCli {
 #[async_trait]
 impl AiBackend for AgyCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let output = tokio::process::Command::new(&self.binary)
-            .args(["-p", prompt, "--dangerously-skip-permissions"])
+        let temp_file =
+            std::env::temp_dir().join(format!("agy_prompt_{}.txt", uuid::Uuid::new_v4()));
+
+        tokio::fs::write(&temp_file, prompt)
+            .await
+            .context("Failed to write prompt to temp file")?;
+
+        let output = create_command(&self.binary)
+            .args([
+                "-f",
+                temp_file.to_str().unwrap_or(""),
+                "--dangerously-skip-permissions",
+            ])
             .output()
             .await
             .with_context(|| format!("Failed to run '{}'", self.binary))?;
 
+        let _ = tokio::fs::remove_file(&temp_file).await;
+
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "agy cli exited with {}: {}",
-                output.status,
-                stderr.trim()
-            );
+            bail!("agy cli exited with {}: {}", output.status, stderr.trim());
         }
 
         let text =
@@ -339,7 +379,7 @@ impl AiBackend for OllamaApi {
             .json()
             .await
             .context("Failed to parse Ollama response")?;
-        
+
         Ok(data.message.content.trim().to_string())
     }
 }
@@ -415,7 +455,8 @@ fn build_backend(
             Ok(Box::new(AgyCli { binary: bin }))
         }
         "ollama" => {
-            let host = std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+            let host = std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string());
             let m = model.unwrap_or_else(|| "qwen2.5-coder:7b".to_string());
             Ok(Box::new(OllamaApi::new(host, m)))
         }
@@ -448,7 +489,10 @@ fn build_backend(
                 other => bail!("Unknown API provider: '{}'", other),
             }
         }
-        other => bail!("Unknown backend type: '{}' (expected 'claude', 'gemini', 'agy', 'ollama' or 'api')", other),
+        other => bail!(
+            "Unknown backend type: '{}' (expected 'claude', 'gemini', 'agy', 'ollama' or 'api')",
+            other
+        ),
     }
 }
 
