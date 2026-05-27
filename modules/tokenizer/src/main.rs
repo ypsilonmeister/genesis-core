@@ -1,9 +1,8 @@
+use crate::compat::UnixListener;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +126,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                         if let Some(&(_, '.')) = temp.peek() {
                             break;
                         }
-                        
+
                         if !has_dot && !has_e {
                             buf.push(c);
                             chars.next();
@@ -156,13 +155,25 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                 }
 
                 let n: f64 = if has_exponent_dot {
-                    let parts: Vec<&str> = buf.split(|c| c == 'e' || c == 'E').collect();
+                    let parts: Vec<&str> = buf.split(|c| ['e', 'E'].contains(&c)).collect();
                     if parts.len() == 2 {
-                        let mantissa: f64 = parts[0].parse().map_err(|_| TokenizeError::UnknownPattern { position: start_idx })?;
-                        let exponent: f64 = parts[1].parse().map_err(|_| TokenizeError::UnknownPattern { position: start_idx })?;
+                        let mantissa: f64 =
+                            parts[0]
+                                .parse()
+                                .map_err(|_| TokenizeError::UnknownPattern {
+                                    position: start_idx,
+                                })?;
+                        let exponent: f64 =
+                            parts[1]
+                                .parse()
+                                .map_err(|_| TokenizeError::UnknownPattern {
+                                    position: start_idx,
+                                })?;
                         mantissa * 10.0_f64.powf(exponent)
                     } else {
-                        return Err(TokenizeError::UnknownPattern { position: start_idx });
+                        return Err(TokenizeError::UnknownPattern {
+                            position: start_idx,
+                        });
                     }
                 } else {
                     buf.parse().map_err(|_| TokenizeError::UnknownPattern {
@@ -188,7 +199,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                         break;
                     }
                 }
-                
+
                 let lower = buf.to_lowercase();
                 if lower == "nan" {
                     tokens.push(Token::NaN);
@@ -386,25 +397,18 @@ async fn main() -> Result<()> {
             });
         }
     } else {
-        #[cfg(unix)]
-        {
-            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-            let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let listener = UnixListener::bind(uds_path)?;
-            tracing::info!("Listening on UDS {}", uds_path);
-            loop {
-                let (stream, _) = listener.accept().await?;
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
-            }
+        let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
+        let _ = std::fs::remove_file(uds_path);
+        if let Some(parent) = std::path::Path::new(uds_path).parent() {
+            std::fs::create_dir_all(parent)?;
         }
-        #[cfg(not(unix))]
-        {
-            panic!("Unix Domain Sockets are not supported on this platform: {}", addr_or_path);
+        let listener = UnixListener::bind(uds_path)?;
+        tracing::info!("Listening on UDS {}", uds_path);
+        loop {
+            let (stream, _) = listener.accept().await?;
+            tokio::spawn(async move {
+                let _ = handle_client(stream).await;
+            });
         }
     }
 }
@@ -431,19 +435,17 @@ where
         };
 
         let (output, error) = match tokenize(&request.input) {
-            Ok(tokens) => {
-                match serde_json::to_string(&tokens) {
-                    Ok(json) => (Some(json), None),
-                    Err(e) => (
-                        None,
-                        Some(ModuleError {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                            input_position: None,
-                        }),
-                    ),
-                }
-            }
+            Ok(tokens) => match serde_json::to_string(&tokens) {
+                Ok(json) => (Some(json), None),
+                Err(e) => (
+                    None,
+                    Some(ModuleError {
+                        code: "SERIALIZE_ERROR".to_string(),
+                        message: e.to_string(),
+                        input_position: None,
+                    }),
+                ),
+            },
             Err(e) => {
                 let (code, pos) = match e {
                     TokenizeError::UnknownPattern { position } => {
@@ -524,11 +526,7 @@ mod tests {
         let tokens = tokenize("1.2e3 + 2.5e-1").unwrap();
         assert_eq!(
             tokens,
-            vec![
-                Token::Number(1200.0),
-                Token::Plus,
-                Token::Number(0.25),
-            ]
+            vec![Token::Number(1200.0), Token::Plus, Token::Number(0.25),]
         );
     }
 
@@ -585,8 +583,14 @@ mod tests {
 
     #[test]
     fn rejects_malformed_numbers() {
-        assert!(matches!(tokenize("1.2.3").unwrap_err(), TokenizeError::UnknownPattern { .. }));
-        assert!(matches!(tokenize("1e1.5.5").unwrap_err(), TokenizeError::UnknownPattern { .. }));
+        assert!(matches!(
+            tokenize("1.2.3").unwrap_err(),
+            TokenizeError::UnknownPattern { .. }
+        ));
+        assert!(matches!(
+            tokenize("1e1.5.5").unwrap_err(),
+            TokenizeError::UnknownPattern { .. }
+        ));
     }
 
     #[test]
@@ -608,7 +612,7 @@ mod tests {
         assert!(tokenize("sqrt(-1)").is_ok());
         assert!(tokenize("a + b * c / d").is_ok());
         assert!(tokenize("10 / (2 - 2) + ∞").is_ok());
-        
+
         // Newly added tokens
         assert!(tokenize("3 + 5ππ2").is_ok());
         assert!(tokenize("5 * (2 + log(10)) + 3").is_ok());
@@ -616,8 +620,107 @@ mod tests {
         assert!(tokenize("4.5 * (2 + 1) ** 3").is_ok());
         assert!(tokenize("(1 + (2 * 3)) + $5").is_ok());
         assert!(tokenize("√(16) + π").is_ok());
-        
+
         // String literal tests
         assert!(tokenize("3 + \"5\" * 2.5").is_ok());
+    }
+}
+
+pub mod compat {
+    #[cfg(windows)]
+    pub use windows::*;
+
+    #[cfg(unix)]
+    pub use tokio::net::{UnixListener, UnixStream};
+
+    #[cfg(windows)]
+    mod windows {
+        use std::net::SocketAddr;
+        use std::path::Path;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use tokio::net::{TcpListener, TcpStream};
+
+        fn path_to_port(path: impl AsRef<Path>) -> u16 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            path.as_ref().to_string_lossy().hash(&mut hasher);
+            let hash = hasher.finish();
+            (49152 + (hash % 16384)) as u16
+        }
+
+        pub struct UnixListener {
+            inner: TcpListener,
+        }
+
+        impl UnixListener {
+            pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
+                let port = path_to_port(path);
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let std_listener = std::net::TcpListener::bind(addr)?;
+                std_listener.set_nonblocking(true)?;
+                let inner = TcpListener::from_std(std_listener)?;
+                Ok(Self { inner })
+            }
+
+            pub async fn accept(&self) -> std::io::Result<(UnixStream, SocketAddr)> {
+                let (stream, addr) = self.inner.accept().await?;
+                Ok((UnixStream { inner: stream }, addr))
+            }
+        }
+
+        pub struct UnixStream {
+            inner: TcpStream,
+        }
+
+        impl UnixStream {
+            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
+                let port = path_to_port(path);
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let inner = TcpStream::connect(addr).await?;
+                Ok(Self { inner })
+            }
+
+            pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
+                tokio::io::split(self)
+            }
+        }
+
+        // Standard poll_read matching Tokio's trait
+        impl AsyncRead for UnixStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for UnixStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
     }
 }

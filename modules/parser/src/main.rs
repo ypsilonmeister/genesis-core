@@ -1,11 +1,10 @@
+use crate::compat::UnixListener;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-#[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::net::TcpListener;
 
 // =============================================================================
@@ -291,13 +290,13 @@ impl Parser {
                             match self.next() {
                                 Some(Token::Comma) => continue,
                                 Some(Token::RParen) => break,
-                                _ => return Err("Expected ',' or ')' in function call".to_string()),
+                                _ => return Err("Invalid function call syntax".to_string()),
                             }
                         }
                     }
                     Ok(Expr::FunctionCall { name, args })
                 } else {
-                    Err(format!("Expected '(' after function name {}", name))
+                    Err("Expected '(' after function name".to_string())
                 }
             }
             _ => Err(format!("Unexpected token: {:?}", t)),
@@ -331,31 +330,24 @@ async fn main() -> Result<()> {
             });
         }
     } else {
-        #[cfg(unix)]
-        {
-            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-            let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let listener = UnixListener::bind(uds_path)?;
-            tracing::info!("Listening on UDS {}", uds_path);
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to accept UDS connection: {}", e);
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
-            }
+        let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
+        let _ = std::fs::remove_file(uds_path);
+        if let Some(parent) = std::path::Path::new(uds_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
         }
-        #[cfg(not(unix))]
-        {
-            panic!("Unix Domain Sockets are not supported on this platform. Please use TCP (e.g., tcp://127.0.0.1:8080). Path: {}", addr_or_path);
+        let listener = UnixListener::bind(uds_path)?;
+        tracing::info!("Listening on UDS {}", uds_path);
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to accept UDS connection: {}", e);
+                    continue;
+                }
+            };
+            tokio::spawn(async move {
+                let _ = handle_client(stream).await;
+            });
         }
     }
 }
@@ -401,12 +393,12 @@ where
         let mut parser = Parser::new(tokens);
         let (output, error) = match parser.parse_expression() {
             Ok(expr) => {
-                if let Some(t) = parser.peek() {
+                if let Some(_t) = parser.peek() {
                     (
                         None,
                         Some(ModuleError {
                             code: "SYNTAX_ERROR".to_string(),
-                            message: format!("Unexpected token after expression: {:?}", t),
+                            message: "Unexpected token after expression".to_string(),
                             input_position: Some(parser.pos),
                         }),
                     )
@@ -536,6 +528,105 @@ mod tests {
             assert!(matches!(*rhs, Expr::BinOp { op: BinOp::Pow, .. }));
         } else {
             panic!("Expected Pow");
+        }
+    }
+}
+
+pub mod compat {
+    #[cfg(windows)]
+    pub use windows::*;
+
+    #[cfg(unix)]
+    pub use tokio::net::{UnixListener, UnixStream};
+
+    #[cfg(windows)]
+    mod windows {
+        use std::net::SocketAddr;
+        use std::path::Path;
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use tokio::net::{TcpListener, TcpStream};
+
+        fn path_to_port(path: impl AsRef<Path>) -> u16 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            path.as_ref().to_string_lossy().hash(&mut hasher);
+            let hash = hasher.finish();
+            (49152 + (hash % 16384)) as u16
+        }
+
+        pub struct UnixListener {
+            inner: TcpListener,
+        }
+
+        impl UnixListener {
+            pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
+                let port = path_to_port(path);
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let std_listener = std::net::TcpListener::bind(addr)?;
+                std_listener.set_nonblocking(true)?;
+                let inner = TcpListener::from_std(std_listener)?;
+                Ok(Self { inner })
+            }
+
+            pub async fn accept(&self) -> std::io::Result<(UnixStream, SocketAddr)> {
+                let (stream, addr) = self.inner.accept().await?;
+                Ok((UnixStream { inner: stream }, addr))
+            }
+        }
+
+        pub struct UnixStream {
+            inner: TcpStream,
+        }
+
+        impl UnixStream {
+            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
+                let port = path_to_port(path);
+                let addr = SocketAddr::from(([127, 0, 0, 1], port));
+                let inner = TcpStream::connect(addr).await?;
+                Ok(Self { inner })
+            }
+
+            pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
+                tokio::io::split(self)
+            }
+        }
+
+        // Standard poll_read matching Tokio's trait
+        impl AsyncRead for UnixStream {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl AsyncWrite for UnixStream {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Pin::new(&mut self.inner).poll_write(cx, buf)
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
         }
     }
 }
