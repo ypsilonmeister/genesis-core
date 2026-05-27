@@ -2,7 +2,6 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -78,7 +77,6 @@ pub enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
 pub enum Expr {
     Number(f64),
     BinOp {
@@ -97,7 +95,6 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BinOp {
     Add,
     Sub,
@@ -107,7 +104,6 @@ pub enum BinOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum UnaryOp {
     Neg,
     Fact,
@@ -355,6 +351,7 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         {
+            // Windows環境などで、WSL2を使わず直接実行する場合は、引数に tcp://127.0.0.1:ポート番号 を指定してください。
             panic!("Unix Domain Sockets are not supported on this platform. Please use TCP (e.g., tcp://127.0.0.1:8080). Path: {}", addr_or_path);
         }
     }
@@ -372,7 +369,7 @@ where
         if n == 0 {
             break;
         }
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         let request: ModuleRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(e) => {
@@ -401,13 +398,13 @@ where
         let mut parser = Parser::new(tokens);
         let (output, error) = match parser.parse_expression() {
             Ok(expr) => {
-                if let Some(t) = parser.peek() {
+                if parser.peek().is_some() {
                     (
                         None,
                         Some(ModuleError {
                             code: "SYNTAX_ERROR".to_string(),
-                            message: format!("Unexpected token after expression: {:?}", t),
-                            input_position: Some(parser.pos),
+                            message: "Unexpected tokens after expression".to_string(),
+                            input_position: None,
                         }),
                     )
                 } else {
@@ -429,7 +426,7 @@ where
                 Some(ModuleError {
                     code: "SYNTAX_ERROR".to_string(),
                     message: e,
-                    input_position: Some(parser.pos),
+                    input_position: None,
                 }),
             ),
         };
@@ -497,6 +494,7 @@ mod tests {
         ];
         let mut parser = Parser::new(tokens);
         let expr = parser.parse_expression().unwrap();
+        // 1 + (2 * 3)
         assert!(matches!(expr, Expr::BinOp { op: BinOp::Add, .. }));
     }
 
@@ -513,6 +511,7 @@ mod tests {
         ];
         let mut parser = Parser::new(tokens);
         let expr = parser.parse_expression().unwrap();
+        // (1 + 2) * 3
         assert!(matches!(expr, Expr::BinOp { op: BinOp::Mul, .. }));
     }
 
@@ -527,6 +526,7 @@ mod tests {
         ];
         let mut parser = Parser::new(tokens);
         let expr = parser.parse_expression().unwrap();
+        // 2 ^ (3 ^ 2) - right associative
         if let Expr::BinOp {
             op: BinOp::Pow,
             rhs,

@@ -4,7 +4,6 @@ use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -48,26 +47,14 @@ pub enum Token {
     Colon,
     DotDot,
     LShift,
-    RShift,
     Gt,
     Lt,
-    Ge,
-    Le,
-    Eq,
-    Ne,
     Percent,
     Sqrt,
     Cbrt,
     Pi,
-    At,
     Dollar,
     Ampersand,
-    Pipe,
-    LogicalAnd,
-    LogicalOr,
-    Assign,
-    Semicolon,
-    Sum,
     /// ASCII アルファベット始まりの英数字・アンダースコア列 (sin, cos, log2 等)
     Function(String),
     /// 文字列リテラル
@@ -118,8 +105,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                     if c.is_ascii_digit() {
                         buf.push(c);
                         chars.next();
-                    } else if c == '_' {
-                        chars.next(); // Skip underscore in numbers
                     } else if c == '.' {
                         // Check for range operator inside number context
                         let mut temp = chars.clone();
@@ -236,13 +221,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                 chars.next();
             }
             '!' => {
+                tokens.push(Token::Exclamation);
                 chars.next();
-                if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Ne);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Exclamation);
-                }
             }
             '?' => {
                 tokens.push(Token::Question);
@@ -253,74 +233,24 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                 chars.next();
             }
             '>' => {
+                tokens.push(Token::Gt);
                 chars.next();
-                if let Some(&(_, '>')) = chars.peek() {
-                    tokens.push(Token::RShift);
-                    chars.next();
-                } else if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Ge);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Gt);
-                }
             }
             '<' => {
                 chars.next();
                 if let Some(&(_, '<')) = chars.peek() {
                     tokens.push(Token::LShift);
                     chars.next();
-                } else if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Le);
-                    chars.next();
                 } else {
-                    tokens.push(Token::Lt);
-                }
-            }
-            '=' => {
-                chars.next();
-                if let Some(&(_, '=')) = chars.peek() {
-                    tokens.push(Token::Eq);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Assign);
-                }
-            }
-            '&' => {
-                chars.next();
-                if let Some(&(_, '&')) = chars.peek() {
-                    tokens.push(Token::LogicalAnd);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Ampersand);
-                }
-            }
-            '|' => {
-                chars.next();
-                if let Some(&(_, '|')) = chars.peek() {
-                    tokens.push(Token::LogicalOr);
-                    chars.next();
-                } else {
-                    tokens.push(Token::Pipe);
+                    return Err(TokenizeError::UnknownPattern { position: idx });
                 }
             }
             '%' => {
                 tokens.push(Token::Percent);
                 chars.next();
             }
-            '@' => {
-                tokens.push(Token::At);
-                chars.next();
-            }
-            ';' => {
-                tokens.push(Token::Semicolon);
-                chars.next();
-            }
             '√' => {
                 tokens.push(Token::Sqrt);
-                chars.next();
-            }
-            '∛' => {
-                tokens.push(Token::Cbrt);
                 chars.next();
             }
             '∞' => {
@@ -331,12 +261,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
                 tokens.push(Token::Pi);
                 chars.next();
             }
-            'Σ' => {
-                tokens.push(Token::Sum);
-                chars.next();
-            }
             '$' => {
                 tokens.push(Token::Dollar);
+                chars.next();
+            }
+            '&' => {
+                tokens.push(Token::Ampersand);
                 chars.next();
             }
             '"' => {
@@ -369,113 +299,87 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("tokenizer booting (v1.2.1)");
+    tracing::info!("tokenizer booting (v1.2.0)");
 
-    let addr_or_path = env::args()
+    let socket_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "/tmp/genesis-core/tokenizer.sock".to_string());
 
-    if addr_or_path.starts_with("tcp://") {
-        let addr = addr_or_path.strip_prefix("tcp://").unwrap();
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("Listening on TCP {}", addr);
-        loop {
-            let (stream, _) = listener.accept().await?;
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
-        }
-    } else {
-        #[cfg(unix)]
-        {
-            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-            let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let listener = UnixListener::bind(uds_path)?;
-            tracing::info!("Listening on UDS {}", uds_path);
-            loop {
-                let (stream, _) = listener.accept().await?;
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            panic!("Unix Domain Sockets are not supported on this platform: {}", addr_or_path);
-        }
+    let _ = std::fs::remove_file(&socket_path);
+    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+        std::fs::create_dir_all(parent)?;
     }
-}
 
-async fn handle_client<S>(stream: S) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = tokio::io::BufReader::new(reader);
-    let mut line = String::new();
+    let listener = UnixListener::bind(&socket_path)?;
+    tracing::info!("Listening on {}", socket_path);
 
-    if let Ok(n) = reader.read_line(&mut line).await {
-        if n == 0 {
-            return Ok(());
-        }
-        let start = std::time::Instant::now();
-        let request: ModuleRequest = match serde_json::from_str(&line) {
-            Ok(req) => req,
-            Err(e) => {
-                tracing::error!("Failed to parse request: {}", e);
-                return Ok(());
-            }
-        };
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let (reader, mut writer) = stream.split();
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
 
-        let (output, error) = match tokenize(&request.input) {
-            Ok(tokens) => {
-                match serde_json::to_string(&tokens) {
-                    Ok(json) => (Some(json), None),
-                    Err(e) => (
-                        None,
-                        Some(ModuleError {
-                            code: "SERIALIZE_ERROR".to_string(),
-                            message: e.to_string(),
-                            input_position: None,
-                        }),
-                    ),
+            if let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    return;
+                }
+                let start = std::time::Instant::now();
+                let request: ModuleRequest = match serde_json::from_str(&line) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        tracing::error!("Failed to parse request: {}", e);
+                        return;
+                    }
+                };
+
+                let (output, error) = match tokenize(&request.input) {
+                    Ok(tokens) => {
+                        match serde_json::to_string(&tokens) {
+                            Ok(json) => (Some(json), None),
+                            Err(e) => (
+                                None,
+                                Some(ModuleError {
+                                    code: "SERIALIZE_ERROR".to_string(),
+                                    message: e.to_string(),
+                                    input_position: None,
+                                }),
+                            ),
+                        }
+                    }
+                    Err(e) => {
+                        let (code, pos) = match e {
+                            TokenizeError::UnknownPattern { position } => {
+                                ("UNKNOWN_PATTERN", Some(position))
+                            }
+                            TokenizeError::Empty => ("SYNTAX_ERROR", None),
+                        };
+                        (
+                            None,
+                            Some(ModuleError {
+                                code: code.to_string(),
+                                message: e.to_string(),
+                                input_position: pos,
+                            }),
+                        )
+                    }
+                };
+
+                let response = ModuleResponse {
+                    request_id: request.request_id,
+                    output,
+                    error,
+                    processing_ms: start.elapsed().as_millis() as u64,
+                };
+
+                if let Ok(payload) = serde_json::to_vec(&response) {
+                    let mut payload = payload;
+                    payload.push(b'\n');
+                    let _ = writer.write_all(&payload).await;
                 }
             }
-            Err(e) => {
-                let (code, pos) = match e {
-                    TokenizeError::UnknownPattern { position } => {
-                        ("UNKNOWN_PATTERN", Some(position))
-                    }
-                    TokenizeError::Empty => ("SYNTAX_ERROR", None),
-                };
-                (
-                    None,
-                    Some(ModuleError {
-                        code: code.to_string(),
-                        message: e.to_string(),
-                        input_position: pos,
-                    }),
-                )
-            }
-        };
-
-        let response = ModuleResponse {
-            request_id: request.request_id,
-            output,
-            error,
-            processing_ms: start.elapsed().as_millis() as u64,
-        };
-
-        if let Ok(payload) = serde_json::to_vec(&response) {
-            let mut payload = payload;
-            payload.push(b'\n');
-            let _ = writer.write_all(&payload).await;
-        }
+        });
     }
-    Ok(())
 }
 
 fn init_tracing() {
@@ -590,18 +494,19 @@ mod tests {
     }
 
     #[test]
-    fn tokenizes_expanded_patterns() {
-        // Now supporting logical operators and equality
-        assert!(tokenize("a && b").is_ok());
-        assert!(tokenize("x = 10;").is_ok());
-        assert!(tokenize("5! + 10 == 60").is_ok());
-        assert!(tokenize("Σ(x^2)").is_ok());
-        assert!(tokenize("10 <= 20 && 30 != 40").is_ok());
-        assert!(tokenize("∛27").is_ok());
+    fn rejects_unknown_patterns() {
+        // Unsupported Operators/Symbols
+        assert!(matches!(tokenize("a && b").unwrap_err(), TokenizeError::UnknownPattern { .. }));
+        assert!(matches!(tokenize("x = 10;").unwrap_err(), TokenizeError::UnknownPattern { .. }));
+        assert!(matches!(tokenize("@").unwrap_err(), TokenizeError::UnknownPattern { .. }));
+        
+        // Other equation/statement patterns
+        assert!(matches!(tokenize("5! + 10 = 60").unwrap_err(), TokenizeError::UnknownPattern { .. }));
+        assert!(matches!(tokenize("Σ(x^2)").unwrap_err(), TokenizeError::UnknownPattern { .. }));
     }
 
     #[test]
-    fn tokenizes_expanded_patterns_extra() {
+    fn tokenizes_new_unknown_patterns() {
         assert!(tokenize("log(0)").is_ok());
         assert!(tokenize("10 ** 100").is_ok());
         assert!(tokenize("3.14**2 / 0.1").is_ok());

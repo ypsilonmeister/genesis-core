@@ -21,19 +21,18 @@
 // =============================================================================
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixListener;
+use tokio::net::TcpListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
     pub request_id: String,
     pub input: String,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +51,6 @@ pub struct ModuleError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
 pub enum Expr {
     Number(f64),
     BinOp {
@@ -71,7 +69,6 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BinOp {
     Add,
     Sub,
@@ -81,7 +78,6 @@ pub enum BinOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum UnaryOp {
     Neg,
     Fact,
@@ -227,10 +223,6 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                         if args[0] < 0.0 { return Err(EvalError::InvalidArgument("sqrt of negative number".to_string())); }
                         args[0].sqrt()
                     }
-                    "cbrt" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cbrt takes 1 argument".to_string())); }
-                        args[0].cbrt()
-                    }
                     "abs" => {
                         if args.len() != 1 { return Err(EvalError::InvalidArgument("abs takes 1 argument".to_string())); }
                         args[0].abs()
@@ -247,15 +239,13 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
     })
 }
 
-async fn send_response<W>(
-    writer: &mut W,
+async fn send_response(
+    writer: &mut (impl AsyncWriteExt + Unpin),
     request_id: String,
     output: Option<String>,
     error: Option<ModuleError>,
     processing_ms: u64,
-) where
-    W: AsyncWriteExt + Unpin,
-{
+) {
     let response = ModuleResponse {
         request_id,
         output,
@@ -272,7 +262,7 @@ async fn send_response<W>(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("evaluator booting (v2.7 - aligned with parser AST)");
+    tracing::info!("evaluator booting (v2.6 - enhanced division check)");
 
     let addr_or_path = env::args()
         .nth(1)
@@ -319,28 +309,7 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         {
-            // Windows Fallback: Treat as TCP if it doesn't look like a path, otherwise use a default port.
-            let addr = if !addr_or_path.contains('/') && !addr_or_path.contains('\\') && addr_or_path.contains(':') {
-                addr_or_path.clone()
-            } else {
-                let default_addr = "127.0.0.1:8084"; // Unique port for evaluator
-                tracing::warn!("UDS not supported on Windows. Falling back to TCP {}", default_addr);
-                default_addr.to_string()
-            };
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!("Listening on TCP {}", addr);
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to accept TCP connection: {}", e);
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
-            }
+            panic!("Unix Domain Sockets are not supported on this platform: {}", addr_or_path);
         }
     }
 }
@@ -350,7 +319,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
+    let mut reader = tokio::io::BufReader::new(reader);
 
     loop {
         let mut line = String::new();

@@ -1,18 +1,12 @@
-# =============================================================================
-# chain.toml — モジュール呼び出しチェーン定義
-#
-# 起動時に orchestrator が読み込む。
-# Tier 2 で AI が新モジュールを追加するときはこのファイルを書き換える。
-# 手動編集も可だが、Tier 3 (人間承認) として扱う。
-#
-# 順序が重要: 上から下へ順番に呼ばれる。
-# socket は Unix Domain Socket のパス (Phase 1)。
-# =============================================================================
-
 [[modules]]
 name = "normalizer"
 binary = "target/debug/normalizer"
 socket = "/tmp/genesis-core/normalizer.sock"
+
+[[modules]]
+name = "math_expander"
+binary = "target/debug/math_expander"
+socket = "/tmp/genesis-core/math_expander.sock"
 
 [[modules]]
 name = "tokenizer"
