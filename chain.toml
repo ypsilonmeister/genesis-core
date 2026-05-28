@@ -16,7 +16,7 @@ socket = "/tmp/genesis-core/advanced_math.sock"
 [[modules]]
 name = "tokenizer"
 binary = "target/debug/tokenizer"
-socket = "/tmp/genesis-core/tokenizer.sock"
+socket = "/tmp/genesis-core/tokenizer_v2.sock"
 
 [[modules]]
 name = "parser"

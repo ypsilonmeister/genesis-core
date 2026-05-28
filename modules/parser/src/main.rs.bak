@@ -29,6 +29,8 @@ use tokio::net::TcpListener;
 //   evaluator が純粋な計算に集中できるよう、文法解析を分離する。
 // =============================================================================
 
+const MAX_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
     pub request_id: String,
@@ -112,6 +114,7 @@ pub enum BinOp {
     Gt,
     Lt,
     DotDot,
+    Mod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,18 +146,24 @@ impl Parser {
         t
     }
 
-    fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_ternary()
+    fn parse_expression(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        self.parse_ternary(depth + 1)
     }
 
-    fn parse_ternary(&mut self) -> Result<Expr, String> {
-        let node = self.parse_range()?;
+    fn parse_ternary(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let node = self.parse_range(depth + 1)?;
         if let Some(Token::Question) = self.peek() {
             self.next();
-            let truthy = self.parse_expression()?;
+            let truthy = self.parse_expression(depth + 1)?;
             if let Some(Token::Colon) = self.peek() {
                 self.next();
-                let falsy = self.parse_ternary()?; // Right associative
+                let falsy = self.parse_ternary(depth + 1)?;
                 return Ok(Expr::Ternary {
                     cond: Box::new(node),
                     truthy: Box::new(truthy),
@@ -167,11 +176,14 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_range(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_relational()?;
-        while let Some(Token::DotDot) = self.peek() {
+    fn parse_range(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let mut node = self.parse_relational(depth + 1)?;
+        if let Some(Token::DotDot) = self.peek() {
             self.next();
-            let rhs = self.parse_relational()?;
+            let rhs = self.parse_relational(depth + 1)?;
             node = Expr::BinOp {
                 op: BinOp::DotDot,
                 lhs: Box::new(node),
@@ -181,24 +193,23 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_relational(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_shift()?;
-        while let Some(t) = self.peek() {
+    fn parse_relational(&mut self, mut depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let mut node = self.parse_shift(depth + 1)?;
+        while let Some(t) = self.peek().cloned() {
             match t {
-                Token::Gt => {
+                Token::Gt | Token::Lt => {
                     self.next();
-                    let rhs = self.parse_shift()?;
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return Err("Maximum recursion depth exceeded".to_string());
+                    }
+                    let op = if t == Token::Gt { BinOp::Gt } else { BinOp::Lt };
+                    let rhs = self.parse_shift(depth + 1)?;
                     node = Expr::BinOp {
-                        op: BinOp::Gt,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                Token::Lt => {
-                    self.next();
-                    let rhs = self.parse_shift()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Lt,
+                        op,
                         lhs: Box::new(node),
                         rhs: Box::new(rhs),
                     };
@@ -209,11 +220,18 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_shift(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_add_sub()?;
+    fn parse_shift(&mut self, mut depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let mut node = self.parse_add_sub(depth + 1)?;
         while let Some(Token::LShift) = self.peek() {
             self.next();
-            let rhs = self.parse_add_sub()?;
+            depth += 1;
+            if depth > MAX_DEPTH {
+                return Err("Maximum recursion depth exceeded".to_string());
+            }
+            let rhs = self.parse_add_sub(depth + 1)?;
             node = Expr::BinOp {
                 op: BinOp::LShift,
                 lhs: Box::new(node),
@@ -223,24 +241,23 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_add_sub(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_mul_div()?;
-        while let Some(t) = self.peek() {
+    fn parse_add_sub(&mut self, mut depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let mut node = self.parse_mul_div(depth + 1)?;
+        while let Some(t) = self.peek().cloned() {
             match t {
-                Token::Plus => {
+                Token::Plus | Token::Minus => {
                     self.next();
-                    let rhs = self.parse_mul_div()?;
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return Err("Maximum recursion depth exceeded".to_string());
+                    }
+                    let op = if t == Token::Plus { BinOp::Add } else { BinOp::Sub };
+                    let rhs = self.parse_mul_div(depth + 1)?;
                     node = Expr::BinOp {
-                        op: BinOp::Add,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                Token::Minus => {
-                    self.next();
-                    let rhs = self.parse_mul_div()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Sub,
+                        op,
                         lhs: Box::new(node),
                         rhs: Box::new(rhs),
                     };
@@ -251,24 +268,46 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_mul_div(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_pow()?;
-        while let Some(t) = self.peek() {
+    fn parse_mul_div(&mut self, mut depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let mut node = self.parse_unary(depth + 1)?;
+        while let Some(t) = self.peek().cloned() {
             match t {
                 Token::Star => {
                     self.next();
-                    let rhs = self.parse_pow()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Mul,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return Err("Maximum recursion depth exceeded".to_string());
+                    }
+                    if let Some(Token::Star) = self.peek() {
+                        self.next();
+                        let rhs = self.parse_unary(depth + 1)?;
+                        node = Expr::BinOp {
+                            op: BinOp::Pow,
+                            lhs: Box::new(node),
+                            rhs: Box::new(rhs),
+                        };
+                    } else {
+                        let rhs = self.parse_unary(depth + 1)?;
+                        node = Expr::BinOp {
+                            op: BinOp::Mul,
+                            lhs: Box::new(node),
+                            rhs: Box::new(rhs),
+                        };
+                    }
                 }
-                Token::Slash => {
+                Token::Slash | Token::Percent => {
                     self.next();
-                    let rhs = self.parse_pow()?;
+                    depth += 1;
+                    if depth > MAX_DEPTH {
+                        return Err("Maximum recursion depth exceeded".to_string());
+                    }
+                    let op = if t == Token::Slash { BinOp::Div } else { BinOp::Mod };
+                    let rhs = self.parse_unary(depth + 1)?;
                     node = Expr::BinOp {
-                        op: BinOp::Div,
+                        op,
                         lhs: Box::new(node),
                         rhs: Box::new(rhs),
                     };
@@ -279,11 +318,51 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_pow(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_unary()?;
+    fn parse_unary(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        match self.peek() {
+            Some(Token::Plus) => {
+                self.next();
+                self.parse_unary(depth + 1)
+            }
+            Some(Token::Minus) => {
+                self.next();
+                let expr = self.parse_pow(depth + 1)?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(expr),
+                })
+            }
+            Some(Token::Sqrt) => {
+                self.next();
+                let expr = self.parse_pow(depth + 1)?;
+                Ok(Expr::FunctionCall {
+                    name: "sqrt".to_string(),
+                    args: vec![expr],
+                })
+            }
+            Some(Token::Cbrt) => {
+                self.next();
+                let expr = self.parse_pow(depth + 1)?;
+                Ok(Expr::FunctionCall {
+                    name: "cbrt".to_string(),
+                    args: vec![expr],
+                })
+            }
+            _ => self.parse_pow(depth + 1),
+        }
+    }
+
+    fn parse_pow(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        let mut node = self.parse_postfix(depth + 1)?;
         if let Some(Token::Caret) = self.peek() {
             self.next();
-            let rhs = self.parse_pow()?; // Right associative
+            let rhs = self.parse_pow(depth + 1)?;
             node = Expr::BinOp {
                 op: BinOp::Pow,
                 lhs: Box::new(node),
@@ -293,66 +372,29 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, String> {
-        match self.peek() {
-            Some(Token::Minus) => {
-                self.next();
-                let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Neg,
-                    expr: Box::new(expr),
-                })
-            }
-            Some(Token::Plus) => {
-                self.next();
-                self.parse_unary()
-            }
-            Some(Token::Sqrt) => {
-                self.next();
-                let expr = self.parse_unary()?;
-                Ok(Expr::FunctionCall {
-                    name: "sqrt".to_string(),
-                    args: vec![expr],
-                })
-            }
-            Some(Token::Cbrt) => {
-                self.next();
-                let expr = self.parse_unary()?;
-                Ok(Expr::FunctionCall {
-                    name: "cbrt".to_string(),
-                    args: vec![expr],
-                })
-            }
-            _ => self.parse_postfix(),
+    fn parse_postfix(&mut self, mut depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
         }
-    }
-
-    fn parse_postfix(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_primary()?;
-        while let Some(t) = self.peek() {
-            match t {
-                Token::Exclamation => {
-                    self.next();
-                    node = Expr::UnaryOp {
-                        op: UnaryOp::Fact,
-                        expr: Box::new(node),
-                    };
-                }
-                Token::Percent => {
-                    self.next();
-                    node = Expr::BinOp {
-                        op: BinOp::Div,
-                        lhs: Box::new(node),
-                        rhs: Box::new(Expr::Number(100.0)),
-                    };
-                }
-                _ => break,
+        let mut node = self.parse_primary(depth + 1)?;
+        while let Some(Token::Exclamation) = self.peek() {
+            self.next();
+            depth += 1;
+            if depth > MAX_DEPTH {
+                return Err("Maximum recursion depth exceeded".to_string());
             }
+            node = Expr::UnaryOp {
+                op: UnaryOp::Fact,
+                expr: Box::new(node),
+            };
         }
         Ok(node)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self, depth: usize) -> Result<Expr, String> {
+        if depth > MAX_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
         let t = self.peek().cloned();
         match t {
             Some(Token::Number(n)) => {
@@ -361,7 +403,7 @@ impl Parser {
             }
             Some(Token::LParen) => {
                 self.next();
-                let node = self.parse_expression()?;
+                let node = self.parse_expression(depth + 1)?;
                 match self.peek() {
                     Some(Token::RParen) => {
                         self.next();
@@ -380,7 +422,7 @@ impl Parser {
                             self.next();
                         } else {
                             loop {
-                                args.push(self.parse_expression()?);
+                                args.push(self.parse_expression(depth + 1)?);
                                 match self.peek() {
                                     Some(Token::Comma) => {
                                         self.next();
@@ -396,7 +438,10 @@ impl Parser {
                         }
                         Ok(Expr::FunctionCall { name, args })
                     }
-                    _ => Err("Expected '(' after function name".to_string()),
+                    _ => Ok(Expr::FunctionCall {
+                        name,
+                        args: Vec::new(),
+                    }),
                 }
             }
             Some(tok) => Err(format!("Unexpected token: {:?}", tok)),
@@ -405,10 +450,125 @@ impl Parser {
     }
 }
 
+fn check_for_unknown_patterns(expr: &Expr, depth: usize) -> Option<String> {
+    if depth > MAX_DEPTH {
+        return Some("Maximum expression depth exceeded".to_string());
+    }
+    match expr {
+        Expr::Number(n) => {
+            if n.is_infinite() || n.is_nan() {
+                return Some("Invalid number value".to_string());
+            }
+            if n.fract() != 0.0 {
+                return Some("Decimal numbers not supported".to_string());
+            }
+            None
+        }
+        Expr::BinOp { op, lhs, rhs } => {
+            if let Some(msg) = check_for_unknown_patterns(lhs, depth + 1) {
+                return Some(msg);
+            }
+            if let Some(msg) = check_for_unknown_patterns(rhs, depth + 1) {
+                return Some(msg);
+            }
+            if *op == BinOp::Pow {
+                if matches!(**lhs, Expr::BinOp { op: BinOp::Pow, .. })
+                    || matches!(**rhs, Expr::BinOp { op: BinOp::Pow, .. })
+                {
+                    return Some("Nested power operators not supported".to_string());
+                }
+            }
+            match op {
+                BinOp::Div => {
+                    if let Expr::Number(n) = &**rhs {
+                        if *n == 0.0 {
+                            return Some("Division by zero not allowed".to_string());
+                        }
+                        if n.is_infinite() {
+                            return Some("Division by infinity not allowed".to_string());
+                        }
+                    }
+                }
+                BinOp::Mod => {
+                    if let Expr::Number(n) = &**rhs {
+                        if *n == 0.0 {
+                            return Some("Modulo by zero not allowed".to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+        Expr::UnaryOp { op: _, expr } => check_for_unknown_patterns(expr, depth + 1),
+        Expr::FunctionCall { name, args } => {
+            if args.is_empty() {
+                return Some(format!("Variables not supported: {}", name));
+            }
+            for arg in args {
+                if let Some(msg) = check_for_unknown_patterns(arg, depth + 1) {
+                    return Some(msg);
+                }
+            }
+            let supported = matches!(
+                name.as_str(),
+                "log" | "log10" | "log2" | "ln" | "sqrt" | "cbrt" | "asin" | "acos"
+            );
+            if !supported {
+                return Some(format!("Unsupported function: {}", name));
+            }
+            match name.as_str() {
+                "log" | "log10" | "log2" | "ln" => {
+                    if let Some(Expr::Number(n)) = args.first() {
+                        if *n < 0.0 {
+                            return Some(format!("Cannot apply {} to negative number", name));
+                        }
+                        if *n == 0.0 {
+                            return Some(format!("{} of zero is undefined", name));
+                        }
+                    }
+                }
+                "sqrt" => {
+                    if let Some(Expr::Number(n)) = args.first() {
+                        if *n < 0.0 {
+                            return Some("Cannot take square root of negative number".to_string());
+                        }
+                    }
+                }
+                "asin" | "acos" => {
+                    if let Some(Expr::Number(n)) = args.first() {
+                        if *n < -1.0 || *n > 1.0 {
+                            return Some(format!("Domain error: {} only defined for [-1, 1]", name));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+        Expr::Ternary {
+            cond,
+            truthy,
+            falsy,
+        } => {
+            if let Some(msg) = check_for_unknown_patterns(cond, depth + 1) {
+                return Some(msg);
+            }
+            if let Some(msg) = check_for_unknown_patterns(truthy, depth + 1) {
+                return Some(msg);
+            }
+            if let Some(msg) = check_for_unknown_patterns(falsy, depth + 1) {
+                return Some(msg);
+            }
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("parser booting (v1.0)");
+    tracing::info!("parser booting (v1.1)");
 
     let addr_or_path = env::args()
         .nth(1)
@@ -481,7 +641,7 @@ where
                 send_error(
                     &mut writer,
                     request.request_id,
-                    "SYNTAX_ERROR",
+                    "DESERIALIZE_ERROR",
                     format!("Failed to parse tokens: {}", e),
                     start.elapsed().as_millis() as u64,
                 )
@@ -492,7 +652,7 @@ where
         };
 
         let mut parser = Parser::new(tokens);
-        let (output, error) = match parser.parse_expression() {
+        let (output, error) = match parser.parse_expression(0) {
             Ok(expr) => {
                 if let Some(_t) = parser.peek() {
                     (
@@ -501,6 +661,15 @@ where
                             code: "SYNTAX_ERROR".to_string(),
                             message: "Unexpected token after expression".to_string(),
                             input_position: Some(parser.pos),
+                        }),
+                    )
+                } else if let Some(pattern_error) = check_for_unknown_patterns(&expr, 0) {
+                    (
+                        None,
+                        Some(ModuleError {
+                            code: "UNKNOWN_PATTERN".to_string(),
+                            message: pattern_error,
+                            input_position: None,
                         }),
                     )
                 } else {
@@ -596,7 +765,7 @@ mod tests {
             Token::Number(3.0),
         ];
         let mut parser = Parser::new(tokens);
-        let expr = parser.parse_expression().unwrap();
+        let expr = parser.parse_expression(0).unwrap();
         assert!(matches!(expr, Expr::BinOp { op: BinOp::Add, .. }));
     }
 
@@ -612,7 +781,7 @@ mod tests {
             Token::Number(3.0),
         ];
         let mut parser = Parser::new(tokens);
-        let expr = parser.parse_expression().unwrap();
+        let expr = parser.parse_expression(0).unwrap();
         assert!(matches!(expr, Expr::BinOp { op: BinOp::Mul, .. }));
     }
 
@@ -626,7 +795,7 @@ mod tests {
             Token::Number(2.0),
         ];
         let mut parser = Parser::new(tokens);
-        let expr = parser.parse_expression().unwrap();
+        let expr = parser.parse_expression(0).unwrap();
         if let Expr::BinOp {
             op: BinOp::Pow,
             rhs,
@@ -637,6 +806,30 @@ mod tests {
         } else {
             panic!("Expected Pow");
         }
+    }
+
+    #[test]
+    fn test_division_by_zero_detected() {
+        let expr = Expr::BinOp {
+            op: BinOp::Div,
+            lhs: Box::new(Expr::Number(1.0)),
+            rhs: Box::new(Expr::Number(0.0)),
+        };
+        assert!(check_for_unknown_patterns(&expr, 0).is_some());
+    }
+
+    #[test]
+    fn test_recursion_depth_limit() {
+        let mut tokens = Vec::new();
+        for _ in 0..200 {
+            tokens.push(Token::LParen);
+        }
+        tokens.push(Token::Number(1.0));
+        for _ in 0..200 {
+            tokens.push(Token::RParen);
+        }
+        let mut parser = Parser::new(tokens);
+        assert!(parser.parse_expression(0).is_err());
     }
 }
 

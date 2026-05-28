@@ -20,13 +20,14 @@
 //   計算ロジックを分離し、parser の変更が evaluator に波及しないようにする。
 // =============================================================================
 
-use crate::compat::UnixListener;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -103,13 +104,9 @@ pub enum EvalError {
 fn check_result(v: f64) -> Result<f64, EvalError> {
     if v.is_infinite() {
         if v.is_sign_positive() {
-            Err(EvalError::Overflow(
-                "result is positive infinity".to_string(),
-            ))
+            Err(EvalError::Overflow("result is positive infinity".to_string()))
         } else {
-            Err(EvalError::Overflow(
-                "result is negative infinity".to_string(),
-            ))
+            Err(EvalError::Overflow("result is negative infinity".to_string()))
         }
     } else if v.is_nan() {
         Err(EvalError::Overflow("result is NaN".to_string()))
@@ -150,12 +147,8 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                 }
             },
             Task::ComputeBinOp(op) => {
-                let rhs_val = values
-                    .pop()
-                    .ok_or_else(|| EvalError::StackError("missing rhs".to_string()))?;
-                let lhs_val = values
-                    .pop()
-                    .ok_or_else(|| EvalError::StackError("missing lhs".to_string()))?;
+                let rhs_val = values.pop().ok_or_else(|| EvalError::StackError("missing rhs".to_string()))?;
+                let lhs_val = values.pop().ok_or_else(|| EvalError::StackError("missing lhs".to_string()))?;
                 let res = match op {
                     BinOp::Add => lhs_val + rhs_val,
                     BinOp::Sub => lhs_val - rhs_val,
@@ -176,21 +169,15 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                 values.push(check_result(res)?);
             }
             Task::ComputeUnaryOp(op) => {
-                let val = values
-                    .pop()
-                    .ok_or_else(|| EvalError::StackError("missing operand".to_string()))?;
+                let val = values.pop().ok_or_else(|| EvalError::StackError("missing operand".to_string()))?;
                 let res = match op {
                     UnaryOp::Neg => -val,
                     UnaryOp::Fact => {
                         if val < 0.0 || val.fract() != 0.0 {
-                            return Err(EvalError::InvalidArgument(
-                                "factorial requires non-negative integer".to_string(),
-                            ));
+                            return Err(EvalError::InvalidArgument("factorial requires non-negative integer".to_string()));
                         }
                         if val > 170.0 {
-                            return Err(EvalError::Overflow(
-                                "factorial result exceeds f64 range".to_string(),
-                            ));
+                            return Err(EvalError::Overflow("factorial result exceeds f64 range".to_string()));
                         }
                         let mut r = 1.0;
                         for i in 1..=(val as u64) {
@@ -204,100 +191,48 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
             Task::ComputeFunction(name, arg_count) => {
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
-                    args.push(values.pop().ok_or_else(|| {
-                        EvalError::StackError("missing function argument".to_string())
-                    })?);
+                    args.push(values.pop().ok_or_else(|| EvalError::StackError("missing function argument".to_string()))?);
                 }
                 args.reverse();
 
                 let res = match name.as_str() {
                     "sin" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "sin takes 1 argument".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("sin takes 1 argument".to_string())); }
                         args[0].sin()
                     }
                     "cos" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "cos takes 1 argument".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cos takes 1 argument".to_string())); }
                         args[0].cos()
                     }
                     "tan" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "tan takes 1 argument".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("tan takes 1 argument".to_string())); }
                         let c = args[0].cos();
-                        if c == 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
+                        if c == 0.0 { return Err(EvalError::DivisionByZero); }
                         args[0].tan()
                     }
                     "log" | "log10" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "log takes 1 argument".to_string(),
-                            ));
-                        }
-                        if args[0] == 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        if args[0] < 0.0 {
-                            return Err(EvalError::InvalidArgument(
-                                "log of negative number".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log takes 1 argument".to_string())); }
+                        if args[0] == 0.0 { return Err(EvalError::DivisionByZero); }
+                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("log of negative number".to_string())); }
                         args[0].log10()
                     }
                     "ln" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "ln takes 1 argument".to_string(),
-                            ));
-                        }
-                        if args[0] == 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        if args[0] < 0.0 {
-                            return Err(EvalError::InvalidArgument(
-                                "ln of negative number".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("ln takes 1 argument".to_string())); }
+                        if args[0] == 0.0 { return Err(EvalError::DivisionByZero); }
+                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("ln of negative number".to_string())); }
                         args[0].ln()
                     }
                     "sqrt" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "sqrt takes 1 argument".to_string(),
-                            ));
-                        }
-                        if args[0] < 0.0 {
-                            return Err(EvalError::InvalidArgument(
-                                "sqrt of negative number".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("sqrt takes 1 argument".to_string())); }
+                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("sqrt of negative number".to_string())); }
                         args[0].sqrt()
                     }
                     "cbrt" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "cbrt takes 1 argument".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cbrt takes 1 argument".to_string())); }
                         args[0].cbrt()
                     }
                     "abs" => {
-                        if args.len() != 1 {
-                            return Err(EvalError::InvalidArgument(
-                                "abs takes 1 argument".to_string(),
-                            ));
-                        }
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("abs takes 1 argument".to_string())); }
                         args[0].abs()
                     }
                     _ => return Err(EvalError::UnknownFunction(name)),
@@ -307,9 +242,9 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
         }
     }
 
-    values
-        .pop()
-        .ok_or_else(|| EvalError::StackError("empty evaluation stack".to_string()))
+    values.pop().ok_or_else(|| {
+        EvalError::StackError("empty evaluation stack".to_string())
+    })
 }
 
 async fn send_response<W>(
@@ -360,24 +295,52 @@ async fn main() -> Result<()> {
             });
         }
     } else {
-        let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-        let _ = std::fs::remove_file(uds_path);
-        if let Some(parent) = std::path::Path::new(uds_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
+            let _ = std::fs::remove_file(uds_path);
+            if let Some(parent) = std::path::Path::new(uds_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let listener = UnixListener::bind(uds_path)?;
+            tracing::info!("Listening on UDS {}", uds_path);
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to accept UDS connection: {}", e);
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let _ = handle_client(stream).await;
+                });
+            }
         }
-        let listener = UnixListener::bind(uds_path)?;
-        tracing::info!("Listening on UDS {}", uds_path);
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to accept UDS connection: {}", e);
-                    continue;
-                }
+        #[cfg(not(unix))]
+        {
+            // Windows Fallback: Treat as TCP if it doesn't look like a path, otherwise use a default port.
+            let addr = if !addr_or_path.contains('/') && !addr_or_path.contains('\\') && addr_or_path.contains(':') {
+                addr_or_path.clone()
+            } else {
+                let default_addr = "127.0.0.1:8084"; // Unique port for evaluator
+                tracing::warn!("UDS not supported on Windows. Falling back to TCP {}", default_addr);
+                default_addr.to_string()
             };
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
+            let listener = TcpListener::bind(&addr).await?;
+            tracing::info!("Listening on TCP {}", addr);
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Failed to accept TCP connection: {}", e);
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let _ = handle_client(stream).await;
+                });
+            }
         }
     }
 }
@@ -455,9 +418,7 @@ where
                         let code = match e {
                             EvalError::DivisionByZero => "DIVISION_BY_ZERO",
                             EvalError::Overflow(_) => "OVERFLOW",
-                            EvalError::UnknownFunction(_) | EvalError::InvalidArgument(_) => {
-                                "SYNTAX_ERROR"
-                            }
+                            EvalError::UnknownFunction(_) | EvalError::InvalidArgument(_) => "SYNTAX_ERROR",
                             _ => "SYNTAX_ERROR",
                         };
                         send_response(
@@ -554,104 +515,5 @@ mod tests {
             };
         }
         assert_eq!(evaluate(&expr).unwrap(), 1001.0);
-    }
-}
-
-pub mod compat {
-    #[cfg(windows)]
-    pub use windows::*;
-
-    #[cfg(unix)]
-    pub use tokio::net::{UnixListener, UnixStream};
-
-    #[cfg(windows)]
-    mod windows {
-        use std::net::SocketAddr;
-        use std::path::Path;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-        use tokio::net::{TcpListener, TcpStream};
-
-        fn path_to_port(path: impl AsRef<Path>) -> u16 {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            path.as_ref().to_string_lossy().hash(&mut hasher);
-            let hash = hasher.finish();
-            (49152 + (hash % 16384)) as u16
-        }
-
-        pub struct UnixListener {
-            inner: TcpListener,
-        }
-
-        impl UnixListener {
-            pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let std_listener = std::net::TcpListener::bind(addr)?;
-                std_listener.set_nonblocking(true)?;
-                let inner = TcpListener::from_std(std_listener)?;
-                Ok(Self { inner })
-            }
-
-            pub async fn accept(&self) -> std::io::Result<(UnixStream, SocketAddr)> {
-                let (stream, addr) = self.inner.accept().await?;
-                Ok((UnixStream { inner: stream }, addr))
-            }
-        }
-
-        pub struct UnixStream {
-            inner: TcpStream,
-        }
-
-        impl UnixStream {
-            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let inner = TcpStream::connect(addr).await?;
-                Ok(Self { inner })
-            }
-
-            pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
-                tokio::io::split(self)
-            }
-        }
-
-        // Standard poll_read matching Tokio's trait
-        impl AsyncRead for UnixStream {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_read(cx, buf)
-            }
-        }
-
-        impl AsyncWrite for UnixStream {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                Pin::new(&mut self.inner).poll_write(cx, buf)
-            }
-
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_flush(cx)
-            }
-
-            fn poll_shutdown(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_shutdown(cx)
-            }
-        }
     }
 }

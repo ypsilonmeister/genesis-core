@@ -137,6 +137,18 @@ where
                             }
                         }
 
+                        // 4. Check for division by parenthesized expression (e.g., 5.0 / (3.14159 + 1))
+                        if !is_unknown {
+                            for (i, c) in expanded.char_indices() {
+                                if c == '/' {
+                                    if expanded[i + 1..].trim_start().starts_with('(') {
+                                        is_unknown = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         if is_unknown {
                             error = Some(json!({"code": "UNKNOWN_PATTERN", "message": "Pattern not recognized by math_expander", "input_position": null}));
                         } else {

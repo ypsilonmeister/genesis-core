@@ -796,7 +796,12 @@ fn parse_json_response(s: &str) -> Result<serde_json::Value> {
     } else {
         s
     };
-    // { ... } を探す
+    // コードフェンスが剥がれた状態で直接パースできるか試す
+    if let Ok(val) = serde_json::from_str(inner) {
+        return Ok(val);
+    }
+    // パースに失敗した場合は、前後に余計なテキストがある可能性を考慮して
+    // 最初の { と最後の } で切り出す（フォールバック）
     let start = inner.find('{').unwrap_or(0);
     let end = inner.rfind('}').map(|i| i + 1).unwrap_or(inner.len());
     let target = &inner[start..end];
