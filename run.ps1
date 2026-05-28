@@ -132,80 +132,8 @@ while ($true) {
         break
     }
 
-    # 4. Self-Healing Loop if crashed
-    Write-Host "[run.ps1] Orchestrator crashed with exit code $exitCode."
-    
-    # Track crash history for circuit breaker
+    # Crashed: just restart (no Repair AI — it destroys module logic)
+    Write-Host "[run.ps1] Orchestrator crashed with exit code $exitCode. Restarting..." -ForegroundColor Yellow
     $CrashHistory += [DateTime]::Now
-
-    # Ensure git config has name/email so commit doesn't fail
-    $gitName = git config user.name
-    if ([string]::IsNullOrEmpty($gitName)) {
-        git config user.name "Self-Healing Bot"
-        git config user.email "self-healing@genesis.local"
-    }
-
-    # Create pre-repair git backup commit to serve as a rollback point
-    Write-Host "[run.ps1] Creating pre-repair git backup..."
-    git add src/ modules/ orchestrator/src/ Cargo.toml Cargo.lock chain.toml
-    git commit -m "Self-healing backup: Orchestrator crashed" | Out-Null
-    
-    $agyAttempt = 1
-    $resolved = $false
-    
-    while ($agyAttempt -le $MaxAgyAttempts) {
-        Write-Host "[run.ps1] Invoking gemini for self-healing (Attempt $agyAttempt/$MaxAgyAttempts)..."
-        
-        # Read last 50 lines of crash log
-        $crashLog = ""
-        if (Test-Path $LogFile) {
-            $crashLog = Get-Content $LogFile -Tail 50 | Out-String
-        }
-        
-        $prompt = @"
-The orchestrator has crashed. Please analyze the exception, fix the source code (or configuration files) to resolve the issue, and ensure the workspace builds and all tests pass successfully.
-The workspace root directory is "$ScriptDir". You have full permission to read and write files in this directory.
-
---- CRASH LOGS ---
-$crashLog
-------------------
-"@
-        
-        # Invoke gemini directly
-        gemini -p "$prompt" -y
-        
-        # Verify if compilation and tests pass now
-        Write-Host "[run.ps1] Verifying build and tests after repair..."
-        $buildCheck = Start-Process -FilePath "cargo" -ArgumentList "check --workspace" -NoNewWindow -PassThru -Wait
-        $testCheck = $null
-        if ($buildCheck.ExitCode -eq 0) {
-            $testCheck = Start-Process -FilePath "cargo" -ArgumentList "test --workspace" -NoNewWindow -PassThru -Wait
-        }
-        
-        if ($buildCheck.ExitCode -eq 0 -and $testCheck -and $testCheck.ExitCode -eq 0) {
-            Write-Host "[run.ps1] Build and all tests succeeded!"
-            # Amend the temporary backup commit to a descriptive fix commit
-            $commitMsg = "[Self-Healing] Fix crash (Attempt $agyAttempt)`n`nCrash Log Tail:`n$($crashLog.Trim())"
-            git add src/ modules/ orchestrator/src/ Cargo.toml Cargo.lock chain.toml
-            git commit --amend -m $commitMsg | Out-Null
-            $resolved = $true
-            break
-        } else {
-            Write-Host "[run.ps1] Build or tests failed after repair attempt. Rolling back changes..."
-            # Reset to the pre-repair backup state
-            git reset --hard HEAD | Out-Null
-            $agyAttempt++
-        }
-    }
-
-    if ($resolved) {
-        Write-Host "[run.ps1] Re-starting orchestrator..."
-    } else {
-        Write-Host "[run.ps1] Self-healing failed after $MaxAgyAttempts attempts."
-        # Remove the temporary backup commit but keep the files in their original crashed state
-        git reset --soft HEAD~1 | Out-Null
-        Write-Host "[run.ps1] Restored files to original crash state. Manual intervention required."
-        Read-Host "Press Enter to exit..."
-        break
-    }
+    Start-Sleep -Seconds 2
 }
