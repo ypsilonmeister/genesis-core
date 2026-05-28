@@ -41,6 +41,53 @@ pub trait AiBackend: Send + Sync {
 }
 
 // =============================================================================
+// デバッグ用: 生の AI 応答をファイルに保存するラッパー
+// =============================================================================
+
+fn log_raw_response(backend_name: &str, prompt: &str, response: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let log_dir = std::path::Path::new("scratch");
+    let _ = std::fs::create_dir_all(log_dir);
+    let log_path = log_dir.join("ai_raw_responses.log");
+    
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "=============================================================================");
+        let _ = writeln!(file, "TIMESTAMP: {}", timestamp);
+        let _ = writeln!(file, "BACKEND: {}", backend_name);
+        let _ = writeln!(file, "----------------- PROMPT -----------------");
+        let _ = writeln!(file, "{}", prompt);
+        let _ = writeln!(file, "----------------- RESPONSE -----------------");
+        let _ = writeln!(file, "{}", response);
+        let _ = writeln!(file, "=============================================================================\n");
+    }
+}
+
+pub struct LoggingBackend {
+    inner: Box<dyn AiBackend>,
+    name: String,
+}
+
+impl LoggingBackend {
+    pub fn new(inner: Box<dyn AiBackend>, name: impl Into<String>) -> Self {
+        Self {
+            inner,
+            name: name.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl AiBackend for LoggingBackend {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let response = self.inner.complete(prompt).await?;
+        log_raw_response(&self.name, prompt, &response);
+        Ok(response)
+    }
+}
+
+// =============================================================================
 // CLI 実装
 // =============================================================================
 
@@ -534,7 +581,8 @@ pub fn build_repair_backend() -> Result<Box<dyn AiBackend>> {
         .ok()
         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
 
-    build_backend(&backend, binary, api_provider, model, api_key)
+    let inner = build_backend(&backend, binary, api_provider, model, api_key)?;
+    Ok(Box::new(LoggingBackend::new(inner, format!("REPAIR ({})", backend))))
 }
 
 pub fn build_repair_fallback_backend() -> Result<Box<dyn AiBackend>> {
@@ -555,7 +603,8 @@ pub fn build_repair_fallback_backend() -> Result<Box<dyn AiBackend>> {
         .ok()
         .or_else(|| std::env::var("GEMINI_API_KEY").ok());
 
-    build_backend(&backend, binary, api_provider, model, api_key)
+    let inner = build_backend(&backend, binary, api_provider, model, api_key)?;
+    Ok(Box::new(LoggingBackend::new(inner, format!("REPAIR_FALLBACK ({})", backend))))
 }
 
 pub fn build_attack_backend() -> Result<Box<dyn AiBackend>> {
@@ -577,5 +626,6 @@ pub fn build_attack_backend() -> Result<Box<dyn AiBackend>> {
         .ok()
         .or_else(|| std::env::var("GEMINI_API_KEY").ok());
 
-    build_backend(&backend, binary, api_provider, model, api_key)
+    let inner = build_backend(&backend, binary, api_provider, model, api_key)?;
+    Ok(Box::new(LoggingBackend::new(inner, format!("ATTACK ({})", backend))))
 }

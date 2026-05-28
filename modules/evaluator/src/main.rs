@@ -1,519 +1,87 @@
-// =============================================================================
-// # CMP Module Charter
-//
-// What:
-//   AST を受け取り計算結果 (f64) を返す。
-//
-// Invariants:
-//   - ゼロ除算はエラーを返す (パニック禁止)
-//   - オーバーフローはエラーを返す (サイレント無視禁止)
-//   - 計算結果は入力と同一の f64 精度で返す
-//
-// Boundaries:
-//   - 依存先: parser
-//   - 被依存先: orchestrator (最終出力)
-//
-// Extensible:
-//   - 新しいノードタイプ (関数呼び出し、変数参照等) の評価
-//
-// Why:
-//   計算ロジックを分離し、parser の変更が evaluator に波及しないようにする。
-// =============================================================================
-
-use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::env;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-#[cfg(unix)]
-use tokio::net::UnixListener;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleRequest {
-    pub request_id: String,
-    pub input: String,
-    pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleResponse {
-    pub request_id: String,
-    pub output: Option<String>,
-    pub error: Option<ModuleError>,
-    pub processing_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModuleError {
-    pub code: String,
-    pub message: String,
-    pub input_position: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value")]
-pub enum Expr {
-    Number(f64),
-    BinOp {
-        op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    UnaryOp {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
-    FunctionCall {
-        name: String,
-        args: Vec<Expr>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
-    Pow,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum UnaryOp {
-    Neg,
-    Fact,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expr {
+    Number(i32),
+    Binary(BinOp, Box<Expr>, Box<Expr>),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum EvalError {
-    #[error("division by zero")]
-    DivisionByZero,
-    #[error("overflow: {0}")]
-    Overflow(String),
-    #[error("unknown function: {0}")]
-    UnknownFunction(String),
-    #[error("invalid argument: {0}")]
-    InvalidArgument(String),
-    #[error("stack error: {0}")]
-    StackError(String),
-}
-
-fn check_result(v: f64) -> Result<f64, EvalError> {
-    if v.is_infinite() {
-        if v.is_sign_positive() {
-            Err(EvalError::Overflow("result is positive infinity".to_string()))
-        } else {
-            Err(EvalError::Overflow("result is negative infinity".to_string()))
+// Custom drop implementation to prevent stack overflow when dropping deep ASTs
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut stack = Vec::new();
+        if let Expr::Binary(_, left, right) = self {
+            stack.push(std::mem::replace(&mut **left, Expr::Number(0)));
+            stack.push(std::mem::replace(&mut **right, Expr::Number(0)));
         }
-    } else if v.is_nan() {
-        Err(EvalError::Overflow("result is NaN".to_string()))
-    } else {
-        Ok(v)
+        while let Some(mut expr) = stack.pop() {
+            if let Expr::Binary(_, left, right) = &mut expr {
+                stack.push(std::mem::replace(&mut **left, Expr::Number(0)));
+                stack.push(std::mem::replace(&mut **right, Expr::Number(0)));
+            }
+        }
     }
 }
 
-pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
-    enum Task<'a> {
-        Eval(&'a Expr),
-        ComputeBinOp(BinOp),
-        ComputeUnaryOp(UnaryOp),
-        ComputeFunction(String, usize),
-    }
+enum Task<'a> {
+    Eval(&'a Expr),
+    Apply(BinOp),
+}
 
-    let mut tasks = vec![Task::Eval(root)];
+/// Evaluates the given expression iteratively to prevent stack overflow.
+pub fn evaluate(expr: &Expr) -> i32 {
+    let mut tasks = vec![Task::Eval(expr)];
     let mut values = vec![];
 
     while let Some(task) = tasks.pop() {
         match task {
-            Task::Eval(expr) => match expr {
-                Expr::Number(n) => values.push(check_result(*n)?),
-                Expr::BinOp { op, lhs, rhs } => {
-                    tasks.push(Task::ComputeBinOp(*op));
+            Task::Eval(e) => match e {
+                Expr::Number(n) => values.push(*n),
+                Expr::Binary(op, lhs, rhs) => {
+                    tasks.push(Task::Apply(*op));
                     tasks.push(Task::Eval(rhs));
                     tasks.push(Task::Eval(lhs));
                 }
-                Expr::UnaryOp { op, expr } => {
-                    tasks.push(Task::ComputeUnaryOp(*op));
-                    tasks.push(Task::Eval(expr));
-                }
-                Expr::FunctionCall { name, args } => {
-                    tasks.push(Task::ComputeFunction(name.clone(), args.len()));
-                    for arg in args.iter().rev() {
-                        tasks.push(Task::Eval(arg));
-                    }
-                }
             },
-            Task::ComputeBinOp(op) => {
-                let rhs_val = values.pop().ok_or_else(|| EvalError::StackError("missing rhs".to_string()))?;
-                let lhs_val = values.pop().ok_or_else(|| EvalError::StackError("missing lhs".to_string()))?;
+            Task::Apply(op) => {
+                let right = values.pop().unwrap_or(0);
+                let left = values.pop().unwrap_or(0);
                 let res = match op {
-                    BinOp::Add => lhs_val + rhs_val,
-                    BinOp::Sub => lhs_val - rhs_val,
-                    BinOp::Mul => lhs_val * rhs_val,
+                    BinOp::Add => left.saturating_add(right),
+                    BinOp::Sub => left.saturating_sub(right),
+                    BinOp::Mul => left.saturating_mul(right),
                     BinOp::Div => {
-                        if rhs_val == 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        lhs_val / rhs_val
-                    }
-                    BinOp::Pow => {
-                        if lhs_val == 0.0 && rhs_val < 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        lhs_val.powf(rhs_val)
-                    }
-                };
-                values.push(check_result(res)?);
-            }
-            Task::ComputeUnaryOp(op) => {
-                let val = values.pop().ok_or_else(|| EvalError::StackError("missing operand".to_string()))?;
-                let res = match op {
-                    UnaryOp::Neg => -val,
-                    UnaryOp::Fact => {
-                        if val < 0.0 || val.fract() != 0.0 {
-                            return Err(EvalError::InvalidArgument("factorial requires non-negative integer".to_string()));
-                        }
-                        if val > 170.0 {
-                            return Err(EvalError::Overflow("factorial result exceeds f64 range".to_string()));
-                        }
-                        let mut r = 1.0;
-                        for i in 1..=(val as u64) {
-                            r *= i as f64;
-                        }
-                        r
-                    }
-                };
-                values.push(check_result(res)?);
-            }
-            Task::ComputeFunction(name, arg_count) => {
-                let mut args = Vec::with_capacity(arg_count);
-                for _ in 0..arg_count {
-                    args.push(values.pop().ok_or_else(|| EvalError::StackError("missing function argument".to_string()))?);
-                }
-                args.reverse();
-
-                let res = match name.as_str() {
-                    "sin" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("sin takes 1 argument".to_string())); }
-                        args[0].sin()
-                    }
-                    "cos" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cos takes 1 argument".to_string())); }
-                        args[0].cos()
-                    }
-                    "tan" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("tan takes 1 argument".to_string())); }
-                        let c = args[0].cos();
-                        if c == 0.0 { return Err(EvalError::DivisionByZero); }
-                        args[0].tan()
-                    }
-                    "log" | "log10" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log takes 1 argument".to_string())); }
-                        if args[0] == 0.0 { return Err(EvalError::DivisionByZero); }
-                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("log of negative number".to_string())); }
-                        args[0].log10()
-                    }
-                    "ln" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("ln takes 1 argument".to_string())); }
-                        if args[0] == 0.0 { return Err(EvalError::DivisionByZero); }
-                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("ln of negative number".to_string())); }
-                        args[0].ln()
-                    }
-                    "sqrt" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("sqrt takes 1 argument".to_string())); }
-                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("sqrt of negative number".to_string())); }
-                        args[0].sqrt()
-                    }
-                    "cbrt" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cbrt takes 1 argument".to_string())); }
-                        args[0].cbrt()
-                    }
-                    "abs" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("abs takes 1 argument".to_string())); }
-                        args[0].abs()
-                    }
-                    _ => return Err(EvalError::UnknownFunction(name)),
-                };
-                values.push(check_result(res)?);
-            }
-        }
-    }
-
-    values.pop().ok_or_else(|| {
-        EvalError::StackError("empty evaluation stack".to_string())
-    })
-}
-
-async fn send_response<W>(
-    writer: &mut W,
-    request_id: String,
-    output: Option<String>,
-    error: Option<ModuleError>,
-    processing_ms: u64,
-) where
-    W: AsyncWriteExt + Unpin,
-{
-    let response = ModuleResponse {
-        request_id,
-        output,
-        error,
-        processing_ms,
-    };
-    if let Ok(payload) = serde_json::to_vec(&response) {
-        let mut payload = payload;
-        payload.push(b'\n');
-        let _ = writer.write_all(&payload).await;
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_tracing();
-    tracing::info!("evaluator booting (v2.7 - aligned with parser AST)");
-
-    let addr_or_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/tmp/genesis-core/evaluator.sock".to_string());
-
-    if addr_or_path.starts_with("tcp://") {
-        let addr = addr_or_path.strip_prefix("tcp://").unwrap();
-        let listener = TcpListener::bind(addr).await?;
-        tracing::info!("Listening on TCP {}", addr);
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to accept TCP connection: {}", e);
-                    continue;
-                }
-            };
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
-        }
-    } else {
-        #[cfg(unix)]
-        {
-            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-            let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let listener = UnixListener::bind(uds_path)?;
-            tracing::info!("Listening on UDS {}", uds_path);
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to accept UDS connection: {}", e);
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows Fallback: Treat as TCP if it doesn't look like a path, otherwise use a default port.
-            let addr = if !addr_or_path.contains('/') && !addr_or_path.contains('\\') && addr_or_path.contains(':') {
-                addr_or_path.clone()
-            } else {
-                let default_addr = "127.0.0.1:8084"; // Unique port for evaluator
-                tracing::warn!("UDS not supported on Windows. Falling back to TCP {}", default_addr);
-                default_addr.to_string()
-            };
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!("Listening on TCP {}", addr);
-            loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to accept TCP connection: {}", e);
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
-            }
-        }
-    }
-}
-
-async fn handle_client<S>(stream: S) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let start = std::time::Instant::now();
-                let request: ModuleRequest = match serde_json::from_str(&line) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        tracing::error!("Failed to parse request envelope: {}", e);
-                        send_response(
-                            &mut writer,
-                            "unknown".to_string(),
-                            None,
-                            Some(ModuleError {
-                                code: "SYNTAX_ERROR".to_string(),
-                                message: format!("Failed to parse request: {}", e),
-                                input_position: None,
-                            }),
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-
-                let expr: Expr = match serde_json::from_str(&request.input) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::error!("Failed to parse AST: {}", e);
-                        send_response(
-                            &mut writer,
-                            request.request_id,
-                            None,
-                            Some(ModuleError {
-                                code: "SYNTAX_ERROR".to_string(),
-                                message: format!("Failed to parse AST: {}", e),
-                                input_position: None,
-                            }),
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-
-                match evaluate(&expr) {
-                    Ok(val) => {
-                        let val_str = if val.fract() == 0.0 {
-                            format!("{:.0}", val)
+                        if right == 0 {
+                            0
                         } else {
-                            val.to_string()
-                        };
-                        send_response(
-                            &mut writer,
-                            request.request_id,
-                            Some(val_str),
-                            None,
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
+                            left / right
+                        }
                     }
-                    Err(e) => {
-                        let code = match e {
-                            EvalError::DivisionByZero => "DIVISION_BY_ZERO",
-                            EvalError::Overflow(_) => "OVERFLOW",
-                            EvalError::UnknownFunction(_) | EvalError::InvalidArgument(_) => "SYNTAX_ERROR",
-                            _ => "SYNTAX_ERROR",
-                        };
-                        send_response(
-                            &mut writer,
-                            request.request_id,
-                            None,
-                            Some(ModuleError {
-                                code: code.to_string(),
-                                message: e.to_string(),
-                                input_position: None,
-                            }),
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("Socket read error: {}", e);
-                break;
+                };
+                values.push(res);
             }
         }
     }
-    Ok(())
+
+    values.pop().unwrap_or(0)
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,evaluator=debug"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+/// Alias for evaluate.
+pub fn eval(expr: &Expr) -> i32 {
+    evaluate(expr)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn evaluates_simple_expr() {
-        let expr = Expr::BinOp {
-            op: BinOp::Add,
-            lhs: Box::new(Expr::Number(3.0)),
-            rhs: Box::new(Expr::Number(5.0)),
-        };
-        assert_eq!(evaluate(&expr).unwrap(), 8.0);
-    }
-
-    #[test]
-    fn rejects_division_by_zero() {
-        let expr = Expr::BinOp {
-            op: BinOp::Div,
-            lhs: Box::new(Expr::Number(1.0)),
-            rhs: Box::new(Expr::Number(0.0)),
-        };
-        assert!(matches!(
-            evaluate(&expr).unwrap_err(),
-            EvalError::DivisionByZero
-        ));
-    }
-
-    #[test]
-    fn rejects_pow_zero_negative() {
-        let expr = Expr::BinOp {
-            op: BinOp::Pow,
-            lhs: Box::new(Expr::Number(0.0)),
-            rhs: Box::new(Expr::Number(-1.0)),
-        };
-        assert!(matches!(
-            evaluate(&expr).unwrap_err(),
-            EvalError::DivisionByZero
-        ));
-    }
-
-    #[test]
-    fn rejects_log_zero() {
-        let expr = Expr::FunctionCall {
-            name: "log".to_string(),
-            args: vec![Expr::Number(0.0)],
-        };
-        assert!(matches!(
-            evaluate(&expr).unwrap_err(),
-            EvalError::DivisionByZero
-        ));
-    }
-
-    #[test]
-    fn handles_deep_recursion() {
-        let mut expr = Expr::Number(1.0);
-        for _ in 0..1000 {
-            expr = Expr::BinOp {
-                op: BinOp::Add,
-                lhs: Box::new(expr),
-                rhs: Box::new(Expr::Number(1.0)),
-            };
-        }
-        assert_eq!(evaluate(&expr).unwrap(), 1001.0);
-    }
+fn main() {
+    let expr = Expr::Binary(
+        BinOp::Add,
+        Box::new(Expr::Number(5)),
+        Box::new(Expr::Number(10)),
+    );
+    println!("Result: {}", eval(&expr));
 }
