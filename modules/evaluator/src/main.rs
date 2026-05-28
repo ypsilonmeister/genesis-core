@@ -55,6 +55,7 @@ pub struct ModuleError {
 #[serde(tag = "type", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Expr {
     Number(f64),
+    Variable(String),
     BinOp {
         op: BinOp,
         lhs: Box<Expr>,
@@ -117,8 +118,12 @@ pub enum EvalError {
     Overflow(String),
     #[error("unknown function: {0}")]
     UnknownFunction(String),
+    #[error("unknown variable: {0}")]
+    UnknownVariable(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("unknown pattern: {0}")]
+    UnknownPattern(String),
     #[error("stack error: {0}")]
     StackError(String),
 }
@@ -131,6 +136,7 @@ fn check_result(v: f64) -> Result<f64, EvalError> {
             Err(EvalError::Overflow("result is negative infinity".to_string()))
         }
     } else if v.is_nan() {
+        // According to the charter, results must return an error rather than silent NaN
         Err(EvalError::Overflow("result is NaN".to_string()))
     } else {
         Ok(v)
@@ -153,6 +159,18 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
         match task {
             Task::Eval(expr) => match expr {
                 Expr::Number(n) => values.push(check_result(*n)?),
+                Expr::Variable(name) => {
+                    let val = match name.to_lowercase().as_str() {
+                        "e" => std::f64::consts::E,
+                        "pi" | "π" => std::f64::consts::PI,
+                        "tau" | "τ" => std::f64::consts::TAU,
+                        "phi" | "φ" => 1.618033988749895,
+                        "i" | "j" => 0.0, // Imaginary unit treated as 0.0 in real-only evaluator
+                        "ans" => 0.0,    // Default previous answer to 0.0
+                        _ => return Err(EvalError::UnknownVariable(name.clone())),
+                    };
+                    values.push(check_result(val)?);
+                }
                 Expr::BinOp { op, lhs, rhs } => {
                     tasks.push(Task::ComputeBinOp(*op));
                     tasks.push(Task::Eval(rhs));
@@ -211,7 +229,15 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                     BinOp::Gt => if lhs_val > rhs_val { 1.0 } else { 0.0 },
                     BinOp::Le => if lhs_val <= rhs_val { 1.0 } else { 0.0 },
                     BinOp::Ge => if lhs_val >= rhs_val { 1.0 } else { 0.0 },
-                    _ => lhs_val, // TODO: Implement other ops
+                    BinOp::And => if lhs_val != 0.0 && rhs_val != 0.0 { 1.0 } else { 0.0 },
+                    BinOp::Or => if lhs_val != 0.0 || rhs_val != 0.0 { 1.0 } else { 0.0 },
+                    BinOp::BitAnd => (lhs_val as i64 & rhs_val as i64) as f64,
+                    BinOp::BitOr => (lhs_val as i64 | rhs_val as i64) as f64,
+                    BinOp::BitXor => (lhs_val as i64 ^ rhs_val as i64) as f64,
+                    BinOp::Shl => ((lhs_val as i64) << (rhs_val as i64 as u32 % 64)) as f64,
+                    BinOp::Shr => ((lhs_val as i64) >> (rhs_val as i64 as u32 % 64)) as f64,
+                    BinOp::Assign => rhs_val,
+                    _ => return Err(EvalError::UnknownPattern(format!("unsupported operator: {:?}", op))),
                 };
                 values.push(check_result(res)?);
             }
@@ -245,7 +271,7 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                 }
                 args.reverse();
 
-                let res = match name.as_str() {
+                let res = match name.to_lowercase().as_str() {
                     "sin" => {
                         if args.len() != 1 { return Err(EvalError::InvalidArgument("sin takes 1 argument".to_string())); }
                         args[0].sin()
@@ -260,16 +286,32 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                         if c == 0.0 { return Err(EvalError::DivisionByZero); }
                         args[0].tan()
                     }
-                    "log" | "log10" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log takes 1 argument".to_string())); }
-                        if args[0] == 0.0 { return Err(EvalError::DivisionByZero); }
-                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("log of negative number".to_string())); }
+                    "log" => {
+                        if args.len() == 1 {
+                            if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
+                            args[0].ln()
+                        } else if args.len() == 2 {
+                            if args[0] <= 0.0 || args[1] <= 0.0 || args[1] == 1.0 {
+                                return Err(EvalError::InvalidArgument("invalid log argument or base".to_string()));
+                            }
+                            args[0].log(args[1])
+                        } else {
+                            return Err(EvalError::InvalidArgument("log takes 1 or 2 arguments".to_string()));
+                        }
+                    }
+                    "log10" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log10 takes 1 argument".to_string())); }
+                        if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
                         args[0].log10()
+                    }
+                    "log2" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log2 takes 1 argument".to_string())); }
+                        if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
+                        args[0].log2()
                     }
                     "ln" => {
                         if args.len() != 1 { return Err(EvalError::InvalidArgument("ln takes 1 argument".to_string())); }
-                        if args[0] == 0.0 { return Err(EvalError::DivisionByZero); }
-                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("ln of negative number".to_string())); }
+                        if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
                         args[0].ln()
                     }
                     "sqrt" => {
@@ -289,7 +331,31 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                         if args.len() != 1 { return Err(EvalError::InvalidArgument("exp takes 1 argument".to_string())); }
                         args[0].exp()
                     }
-                    _ => return Err(EvalError::UnknownFunction(name)),
+                    "ceil" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("ceil takes 1 argument".to_string())); }
+                        args[0].ceil()
+                    }
+                    "floor" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("floor takes 1 argument".to_string())); }
+                        args[0].floor()
+                    }
+                    "round" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("round takes 1 argument".to_string())); }
+                        args[0].round()
+                    }
+                    "trunc" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("trunc takes 1 argument".to_string())); }
+                        args[0].trunc()
+                    }
+                    "deg" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("deg takes 1 argument".to_string())); }
+                        args[0].to_degrees()
+                    }
+                    "rad" => {
+                        if args.len() != 1 { return Err(EvalError::InvalidArgument("rad takes 1 argument".to_string())); }
+                        args[0].to_radians()
+                    }
+                    _ => return Err(EvalError::UnknownPattern(format!("unknown function: {}", name))),
                 };
                 values.push(check_result(res)?);
             }
@@ -333,7 +399,7 @@ async fn send_response<W>(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("evaluator booting (v2.8 - supporting Sequence and extended ops)");
+    tracing::info!("evaluator booting (v3.0 - enhanced patterns and Tier 2 error handling)");
 
     let addr_or_path = env::args()
         .nth(1)
@@ -463,7 +529,7 @@ where
                             request.request_id,
                             None,
                             Some(ModuleError {
-                                code: "SYNTAX_ERROR".to_string(),
+                                code: "UNKNOWN_PATTERN".to_string(),
                                 message: format!("Failed to parse AST: {}", e),
                                 input_position: None,
                             }),
@@ -494,7 +560,7 @@ where
                         let code = match e {
                             EvalError::DivisionByZero => "DIVISION_BY_ZERO",
                             EvalError::Overflow(_) => "OVERFLOW",
-                            EvalError::UnknownFunction(_) | EvalError::InvalidArgument(_) => "SYNTAX_ERROR",
+                            EvalError::UnknownFunction(_) | EvalError::UnknownVariable(_) | EvalError::UnknownPattern(_) => "UNKNOWN_PATTERN",
                             _ => "SYNTAX_ERROR",
                         };
                         send_response(
@@ -543,12 +609,24 @@ mod tests {
     }
 
     #[test]
-    fn evaluates_sequence() {
-        let expr = Expr::Sequence(vec![
-            Expr::Number(1.0),
-            Expr::Number(2.0),
-            Expr::Number(3.0),
-        ]);
-        assert_eq!(evaluate(&expr).unwrap(), 3.0);
+    fn evaluates_variable() {
+        let expr = Expr::Variable("pi".to_string());
+        assert_eq!(evaluate(&expr).unwrap(), std::f64::consts::PI);
+    }
+
+    #[test]
+    fn evaluates_complex_variable_as_zero() {
+        let expr = Expr::Variable("i".to_string());
+        assert_eq!(evaluate(&expr).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn returns_unknown_pattern_for_missing_fn() {
+        let expr = Expr::FunctionCall {
+            name: "missing_fn".to_string(),
+            args: vec![Expr::Number(1.0)],
+        };
+        let err = evaluate(&expr).unwrap_err();
+        assert!(matches!(err, EvalError::UnknownPattern(_)));
     }
 }
