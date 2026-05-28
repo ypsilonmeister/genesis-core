@@ -319,13 +319,29 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         {
-            // Windows Fallback: Treat as TCP if it doesn't look like a path, otherwise use a default port.
+            use std::path::Path;
+            fn path_to_port(path: impl AsRef<Path>) -> u16 {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                let file_name = path
+                    .as_ref()
+                    .file_name()
+                    .map(|f| f.to_string_lossy())
+                    .unwrap_or_else(|| path.as_ref().to_string_lossy());
+                file_name.hash(&mut hasher);
+                let hash = hasher.finish();
+                (49152 + (hash % 16384)) as u16
+            }
+
+            // Windows Fallback: Treat as TCP if it doesn't look like a path, otherwise compute port from path.
             let addr = if !addr_or_path.contains('/') && !addr_or_path.contains('\\') && addr_or_path.contains(':') {
                 addr_or_path.clone()
             } else {
-                let default_addr = "127.0.0.1:8084"; // Unique port for evaluator
+                let port = path_to_port(&addr_or_path);
+                let default_addr = format!("127.0.0.1:{}", port);
                 tracing::warn!("UDS not supported on Windows. Falling back to TCP {}", default_addr);
-                default_addr.to_string()
+                default_addr
             };
             let listener = TcpListener::bind(&addr).await?;
             tracing::info!("Listening on TCP {}", addr);

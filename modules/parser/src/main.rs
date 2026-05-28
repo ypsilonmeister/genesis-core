@@ -658,7 +658,12 @@ pub mod compat {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             let mut hasher = DefaultHasher::new();
-            path.as_ref().to_string_lossy().hash(&mut hasher);
+            let file_name = path
+                .as_ref()
+                .file_name()
+                .map(|f| f.to_string_lossy())
+                .unwrap_or_else(|| path.as_ref().to_string_lossy());
+            file_name.hash(&mut hasher);
             let hash = hasher.finish();
             (49152 + (hash % 16384)) as u16
         }
