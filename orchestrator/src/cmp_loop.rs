@@ -99,19 +99,45 @@ impl CmpLoop {
             .with_context(|| format!("Cannot read {}", module_source_path))?;
         let module_charter = extract_charter(&module_code);
 
+        // コードが既に壊れている（空 main / 行数が極端に少ない）場合は現在のコードを
+        // ベースにせず、エラー情報だけを渡す。
+        let code_looks_broken = module_code.lines().count() < 20
+            || (module_code.contains("fn main()") && !module_code.contains("async fn main") && !module_code.contains("UnixListener") && !module_code.contains("TcpListener"));
+
+        let code_section = if code_looks_broken {
+            format!(
+                "WARNING: The current source file appears corrupted or empty (it lacks IPC listener logic). \
+                Do NOT use it as a base. Rewrite from scratch following the Module Charter.\n\
+                Corrupted file content (for reference only):\n```rust\n{module_code}\n```"
+            )
+        } else {
+            format!("Current Code:\n```rust\n{module_code}\n```")
+        };
+
         let initial_prompt = format!(
-            "The following Rust module is repeatedly experiencing errors.\n\n\
-            Module Charter:\n{module_charter}\n\n\
+            "## Context\n\
+            This is a Rust module in the 'Lying Calculator' pipeline. \
+            Each module is an IPC service that listens on a Unix socket (or TCP on Windows), \
+            reads newline-delimited JSON requests, processes them, and writes JSON responses. \
+            The module must NOT be a standalone script or data printer — it must implement \
+            a socket listener loop.\n\n\
+            ## Problem\n\
+            The module '{module_name}' is repeatedly experiencing errors.\n\
             Error Code: {error_code}\n\
-            Occurrence Count: {error_count}\n\
-            Module Name: {module_name}\n\n\
-            Current Code:\n```rust\n{module_code}\n```\n\n\
+            Occurrence Count: {error_count}\n\n\
+            ## Module Charter\n\
+            {module_charter}\n\n\
+            ## Source\n\
+            {code_section}\n\n\
+            ## Task\n\
             Generate a repair proposal.\n\
             Constraints:\n\
+            - The output MUST be a complete IPC service with a socket listener loop\n\
             - Do not violate Module Charter Invariants\n\
             - Do not modify Module Charter Boundaries\n\
-            - Minimize the scope of changes\n\n\
-            Output: Return the complete fixed Rust code in a ```rust code block. No explanation needed."
+            - Minimize the scope of changes (fix only what is broken)\n\
+            - Do NOT hardcode specific input patterns as data\n\n\
+            Output: Return the complete fixed Rust source in a ```rust code block. No explanation needed."
         );
 
         info!(module = %module_name, error_code = %error_code, count = error_count,
@@ -318,15 +344,26 @@ impl CmpLoop {
         let charters_str = charters.join("\n\n");
 
         let judge_prompt = format!(
-            "The calculator cannot process the following patterns in any module.\n\n\
-            Unknown pattern examples: {examples}\n\
+            "## Context\n\
+            This is the 'Lying Calculator' pipeline: a chain of IPC socket services \
+            (normalizer → tokenizer → parser → evaluator). Each module reads JSON requests \
+            from a socket and writes JSON responses. The pipeline processes mathematical \
+            expression strings and returns computed results or structured errors.\n\n\
+            ## Problem\n\
+            The pipeline cannot process the following input patterns and returns UNKNOWN_PATTERN errors:\n\
+            {examples}\n\n\
             Current module chain: {chain_desc}\n\n\
-            Module Charters:\n{charters_str}\n\n\
-            Make a judgment:\n\
-            A) Can be handled by extending existing modules (normalizer or tokenizer)\n\
-            B) A new module is needed\n\n\
-            Response format: JSON only (no explanation needed)\n\
-            {{\"approach\": \"extend\" | \"new\", \"target_module\": \"module_name\", \"reason\": \"reason\"}}"
+            ## Module Charters\n\
+            {charters_str}\n\n\
+            ## Task\n\
+            Decide whether to:\n\
+            A) Extend an existing module's parsing/evaluation logic to handle these patterns\n\
+            B) Add a new module to the chain\n\n\
+            Prefer (A) if the patterns are within the scope of an existing module's Charter. \
+            Choose (B) only if handling them requires fundamentally different logic that \
+            cannot fit any existing module.\n\n\
+            Response format: JSON only (no explanation)\n\
+            {{\"approach\": \"extend\" | \"new\", \"target_module\": \"module_name\", \"reason\": \"one sentence\"}}"
         );
 
         info!("Tier 2: requesting judgment from repair AI");
@@ -369,15 +406,44 @@ impl CmpLoop {
                 .with_context(|| format!("Cannot read {}", source_path))?;
             let module_charter = extract_charter(&module_code);
 
+            // コードが壊れていればベースにしない
+            let code_looks_broken = module_code.lines().count() < 20
+                || (module_code.contains("fn main()") && !module_code.contains("async fn main") && !module_code.contains("UnixListener") && !module_code.contains("TcpListener"));
+
+            let code_section = if code_looks_broken {
+                format!(
+                    "WARNING: The current source file appears corrupted (it lacks IPC listener logic). \
+                    Do NOT use it as a base. Rewrite from scratch following the Module Charter.\n\
+                    Corrupted file (reference only):\n```rust\n{module_code}\n```"
+                )
+            } else {
+                format!("Current Code:\n```rust\n{module_code}\n```")
+            };
+
             let repair_prompt = format!(
-                "Extend the following module to handle UNKNOWN_PATTERN errors.\n\n\
-                Unknown pattern examples: {examples}\n\n\
-                Module Charter:\n{module_charter}\n\n\
-                Current Code:\n```rust\n{module_code}\n```\n\n\
+                "## Context\n\
+                This is a Rust IPC service in the 'Lying Calculator' pipeline. \
+                It listens on a Unix socket (or TCP on Windows), reads newline-delimited \
+                JSON requests, and writes JSON responses. It must NOT be rewritten as a \
+                standalone script or data printer.\n\n\
+                ## Problem\n\
+                The module '{target}' returns UNKNOWN_PATTERN for the following inputs:\n\
+                {examples}\n\n\
+                These should be handled by improving the module's PARSING or EVALUATION logic \
+                (e.g., adding support for operators, functions, or number formats). \
+                Do NOT hardcode specific input strings as data — implement generalised logic.\n\n\
+                ## Module Charter\n\
+                {module_charter}\n\n\
+                ## Source\n\
+                {code_section}\n\n\
+                ## Task\n\
+                Extend the parsing/evaluation logic to handle the patterns above.\n\
                 Constraints:\n\
+                - The output MUST remain a complete IPC socket service with a listener loop\n\
                 - Do not violate Module Charter Invariants\n\
-                - Minimize the scope of changes\n\n\
-                Output: Return the complete fixed Rust code in a ```rust code block. No explanation needed."
+                - Minimize the scope of changes\n\
+                - Do NOT hardcode patterns as static data\n\n\
+                Output: Return the complete fixed Rust source in a ```rust code block. No explanation needed."
             );
 
             let repair_code = self.repair_ai.complete(&repair_prompt).await?;
