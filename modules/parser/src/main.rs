@@ -11,22 +11,22 @@ use tokio::net::TcpListener;
 // # CMP Module Charter
 //
 // What:
-//   トークン列を演算子優先度を考慮した抽象構文木 (AST) に変換する。
+//   Convert token sequences into an Abstract Syntax Tree (AST), taking operator precedence into account.
 //
 // Invariants:
-//   - 演算子優先度: * / は + - より高い
-//   - 括弧による優先度変更を正しく処理する
-//   - 不正な文法(演算子連続、括弧不一致等)はエラーを返す
+//   - Operator Precedence: * and / have higher precedence than + and -.
+//   - Correctly handle precedence changes caused by parentheses.
+//   - Return an error for invalid syntax (e.g., consecutive operators, unmatched parentheses).
 //
 // Boundaries:
-//   - 依存先: tokenizer
-//   - 被依存先: evaluator
+//   - Dependencies: tokenizer
+//   - Dependents: evaluator
 //
 // Extensible:
-//   - 新しい演算子・関数呼び出し構文の追加
+//   - Addition of new operators or function call syntaxes.
 //
 // Why:
-//   evaluator が純粋な計算に集中できるよう、文法解析を分離する。
+//   Isolate syntax parsing so that the evaluator can focus purely on computation.
 // =============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

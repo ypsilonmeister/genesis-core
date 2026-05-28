@@ -170,7 +170,9 @@ impl CmpLoop {
                         final_build_error.as_deref().unwrap_or("(不明)")
                     )
                 } else {
-                    "テストが失敗しました。".to_string()
+                    self.executor
+                        .read_file("target_repair/test_failure.log")
+                        .unwrap_or_else(|_| "テストが失敗しました。".to_string())
                 };
                 let fix_prompt = format!(
                     "The following Rust code has a {}. Please fix it.\n\n\

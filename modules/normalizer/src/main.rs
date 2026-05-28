@@ -2,24 +2,24 @@
 // # CMP Module Charter
 //
 // What:
-//   入力文字列を正規化して後続モジュールに渡す(空白除去のみ)。
+//   Normalize the input string and pass it to subsequent modules (whitespace removal only).
 //
 // Invariants:
-//   - 入力文字列を破壊的に変更しない(元の入力はログに残す)
-//   - 空文字列を受け取った場合はエラーを返す
+//   - Do not modify the input string destructively (the original input must be logged).
+//   - Return an error if an empty string is received.
 //
 // Boundaries:
-//   - 依存先: なし
-//   - 被依存先: tokenizer
+//   - Dependencies: None
+//   - Dependents: tokenizer
 //
 // Extensible:
-//   - 正規化ルールの追加 (全角→半角変換、不可視文字除去、etc.)
+//   - Addition of normalization rules (e.g., full-width to half-width conversion, invisible character removal, etc.)
 //
 // Why:
-//   後続モジュールが純粋な解析に集中できるよう、表層的なノイズを除去する。
+//   Remove surface noise so that subsequent modules can focus on pure analysis.
 //
-// Tier 1 で AI が改変するときは、上記 Invariants と Boundaries を絶対に
-// 破らないこと。What の範囲を超える変更は Tier 2 として扱う。
+// When modifying in Tier 1, the AI must never violate the above Invariants
+// and Boundaries. Changes beyond the scope of "What" are treated as Tier 2.
 // =============================================================================
 
 // v1 実装範囲:

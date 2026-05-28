@@ -4,19 +4,9 @@ binary = "target/debug/normalizer"
 socket = "/tmp/genesis-core/normalizer.sock"
 
 [[modules]]
-name = "math_expander"
-binary = "target/debug/math_expander"
-socket = "/tmp/genesis-core/math_expander.sock"
-
-[[modules]]
-name = "advanced_math"
-binary = "target/debug/advanced_math"
-socket = "/tmp/genesis-core/advanced_math.sock"
-
-[[modules]]
 name = "tokenizer"
 binary = "target/debug/tokenizer"
-socket = "/tmp/genesis-core/tokenizer_v2.sock"
+socket = "/tmp/genesis-core/tokenizer.sock"
 
 [[modules]]
 name = "parser"

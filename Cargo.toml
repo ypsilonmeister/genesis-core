@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "orchestrator",
-    "modules/*", "test_tokenizer",
+    "modules/*",
 ]
 
 [workspace.package]

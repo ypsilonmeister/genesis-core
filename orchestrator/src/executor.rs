@@ -129,13 +129,25 @@ impl Executor for SystemExecutor {
     }
 
     async fn cargo_test_repair(&self, pkg: &str) -> Result<bool> {
-        Ok(tokio::process::Command::new("cargo")
+        let out = tokio::process::Command::new("cargo")
             .args(["test", "-p", pkg, "--target-dir", "target_repair"])
             .output()
             .await
-            .context("Failed to run cargo test (repair)")?
-            .status
-            .success())
+            .context("Failed to run cargo test (repair)")?;
+
+        if !out.status.success() {
+            let log_content = format!(
+                "STDOUT:\n{}\nSTDERR:\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let _ = std::fs::create_dir_all("target_repair");
+            let _ = std::fs::write("target_repair/test_failure.log", log_content);
+        } else {
+            let _ = std::fs::remove_file("target_repair/test_failure.log");
+        }
+
+        Ok(out.status.success())
     }
 
     async fn hot_swap(&self, swapper: &HotSwapper, old_child: Child) -> Result<Child> {

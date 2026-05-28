@@ -1,6 +1,7 @@
 # Rust
 /target/
 **/*.rs.bk
+**/*.rs.bak
 Cargo.lock.bak
 
 # 環境変数
@@ -35,3 +36,4 @@ Thumbs.db
 *.log
 .claude/settings.local.json
 .antigravitycli/*
+target_repair/*
