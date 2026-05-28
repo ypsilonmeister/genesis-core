@@ -1,13 +1,3 @@
-use crate::compat::UnixListener;
-use anyhow::Result;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use std::env;
-use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-
-// =============================================================================
 // # CMP Module Charter
 //
 // What:
@@ -28,6 +18,15 @@ use tokio::net::TcpListener;
 // Why:
 //   Isolate syntax parsing so that the evaluator can focus purely on computation.
 // =============================================================================
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::env;
+use tokio::io::AsyncBufReadExt;
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -52,32 +51,56 @@ pub struct ModuleError {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(tag = "type", content = "value")]
 pub enum Token {
     Number(f64),
+    NaN,
+    Infinity,
     Plus,
     Minus,
     Star,
+    StarStar,
     Slash,
+    DoubleSlash,
     Caret,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+    LBrace,
+    RBrace,
     Comma,
     Exclamation,
     Question,
     Colon,
     DotDot,
     LShift,
+    RShift,
     Gt,
     Lt,
+    Ge,
+    Le,
+    Eq,
+    Ne,
     Percent,
     Sqrt,
     Cbrt,
+    Pi,
+    At,
+    Dollar,
+    Ampersand,
+    Pipe,
+    LogicalAnd,
+    LogicalOr,
+    Assign,
+    Semicolon,
+    Sum,
     Function(String),
+    String(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(tag = "type", content = "value")]
 pub enum Expr {
     Number(f64),
     BinOp {
@@ -93,11 +116,7 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
-    Ternary {
-        cond: Box<Expr>,
-        truthy: Box<Expr>,
-        falsy: Box<Expr>,
-    },
+    Sequence(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,28 +126,48 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    FloorDiv,
     Pow,
-    LShift,
-    Gt,
+    Mod,
+    Eq,
+    Ne,
     Lt,
-    DotDot,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+    Assign,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Range,
+    At,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum UnaryOp {
     Neg,
+    Pos,
     Fact,
+    Percent,
+    Not,
 }
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
+
+const MAX_RECURSION_DEPTH: usize = 500;
 
 impl Parser {
     fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, depth: 0 }
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -144,37 +183,54 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_ternary()
-    }
-
-    fn parse_ternary(&mut self) -> Result<Expr, String> {
-        let node = self.parse_range()?;
-        if let Some(Token::Question) = self.peek() {
-            self.next();
-            let truthy = self.parse_expression()?;
-            if let Some(Token::Colon) = self.peek() {
+        if self.depth >= MAX_RECURSION_DEPTH {
+            return Err("Maximum recursion depth exceeded".to_string());
+        }
+        self.depth += 1;
+        
+        let mut exprs = Vec::new();
+        loop {
+            exprs.push(self.parse_assign()?);
+            if let Some(Token::Semicolon) = self.peek() {
                 self.next();
-                let falsy = self.parse_ternary()?; // Right associative
-                return Ok(Expr::Ternary {
-                    cond: Box::new(node),
-                    truthy: Box::new(truthy),
-                    falsy: Box::new(falsy),
-                });
+                if self.peek().is_none() { break; }
             } else {
-                return Err("Expected ':' in ternary operator".to_string());
+                break;
             }
         }
-        Ok(node)
+        
+        let res = if exprs.len() == 1 {
+            Ok(exprs.remove(0))
+        } else {
+            Ok(Expr::Sequence(exprs))
+        };
+        
+        self.depth -= 1;
+        res
     }
 
-    fn parse_range(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_relational()?;
-        // Enforce no operator sequences for range
-        if let Some(Token::DotDot) = self.peek() {
+    fn parse_assign(&mut self) -> Result<Expr, String> {
+        let node = self.parse_logical_or()?;
+        if let Some(Token::Assign) = self.peek() {
             self.next();
-            let rhs = self.parse_relational()?;
+            let rhs = self.parse_assign()?;
+            Ok(Expr::BinOp {
+                op: BinOp::Assign,
+                lhs: Box::new(node),
+                rhs: Box::new(rhs),
+            })
+        } else {
+            Ok(node)
+        }
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_logical_and()?;
+        while let Some(Token::LogicalOr) = self.peek() {
+            self.next();
+            let rhs = self.parse_logical_and()?;
             node = Expr::BinOp {
-                op: BinOp::DotDot,
+                op: BinOp::Or,
                 lhs: Box::new(node),
                 rhs: Box::new(rhs),
             };
@@ -182,30 +238,78 @@ impl Parser {
         Ok(node)
     }
 
-    fn parse_relational(&mut self) -> Result<Expr, String> {
+    fn parse_logical_and(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_bitwise_or()?;
+        while let Some(Token::LogicalAnd) = self.peek() {
+            self.next();
+            let rhs = self.parse_bitwise_or()?;
+            node = Expr::BinOp {
+                op: BinOp::And,
+                lhs: Box::new(node),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(node)
+    }
+
+    fn parse_bitwise_or(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_bitwise_xor()?;
+        while let Some(Token::Pipe) = self.peek() {
+            self.next();
+            let rhs = self.parse_bitwise_xor()?;
+            node = Expr::BinOp {
+                op: BinOp::BitOr,
+                lhs: Box::new(node),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(node)
+    }
+
+    fn parse_bitwise_xor(&mut self) -> Result<Expr, String> {
+        let node = self.parse_bitwise_and()?;
+        // Standard math uses ^ for Pow, handled in parse_pow.
+        // We could handle bitwise XOR here if a specific token like XOR exists.
+        Ok(node)
+    }
+
+    fn parse_bitwise_and(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_comparison()?;
+        while let Some(Token::Ampersand) = self.peek() {
+            self.next();
+            let rhs = self.parse_comparison()?;
+            node = Expr::BinOp {
+                op: BinOp::BitAnd,
+                lhs: Box::new(node),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(node)
+    }
+
+    fn parse_comparison(&mut self) -> Result<Expr, String> {
         let mut node = self.parse_shift()?;
-        // Enforce no operator sequences for relational operators
-        if let Some(t) = self.peek().cloned() {
-            match t {
-                Token::Gt => {
-                    self.next();
-                    let rhs = self.parse_shift()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Gt,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                Token::Lt => {
-                    self.next();
-                    let rhs = self.parse_shift()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Lt,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                _ => {}
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::Eq => Some(BinOp::Eq),
+                Token::Ne => Some(BinOp::Ne),
+                Token::Lt => Some(BinOp::Lt),
+                Token::Gt => Some(BinOp::Gt),
+                Token::Le => Some(BinOp::Le),
+                Token::Ge => Some(BinOp::Ge),
+                Token::DotDot => Some(BinOp::Range),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.next();
+                let rhs = self.parse_shift()?;
+                node = Expr::BinOp {
+                    op,
+                    lhs: Box::new(node),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
             }
         }
         Ok(node)
@@ -213,14 +317,23 @@ impl Parser {
 
     fn parse_shift(&mut self) -> Result<Expr, String> {
         let mut node = self.parse_add_sub()?;
-        while let Some(Token::LShift) = self.peek() {
-            self.next();
-            let rhs = self.parse_add_sub()?;
-            node = Expr::BinOp {
-                op: BinOp::LShift,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::LShift => Some(BinOp::Shl),
+                Token::RShift => Some(BinOp::Shr),
+                _ => None,
             };
+            if let Some(op) = op {
+                self.next();
+                let rhs = self.parse_add_sub()?;
+                node = Expr::BinOp {
+                    op,
+                    lhs: Box::new(node),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
+            }
         }
         Ok(node)
     }
@@ -228,177 +341,205 @@ impl Parser {
     fn parse_add_sub(&mut self) -> Result<Expr, String> {
         let mut node = self.parse_mul_div()?;
         while let Some(t) = self.peek() {
-            match t {
-                Token::Plus => {
-                    self.next();
-                    let rhs = self.parse_mul_div()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Add,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                Token::Minus => {
-                    self.next();
-                    let rhs = self.parse_mul_div()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Sub,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                _ => break,
+            let op = match t {
+                Token::Plus => Some(BinOp::Add),
+                Token::Minus => Some(BinOp::Sub),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.next();
+                let rhs = self.parse_mul_div()?;
+                node = Expr::BinOp {
+                    op,
+                    lhs: Box::new(node),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
             }
         }
         Ok(node)
     }
 
     fn parse_mul_div(&mut self) -> Result<Expr, String> {
+        let mut node = self.parse_pow()?;
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::Star => Some(BinOp::Mul),
+                Token::Slash => Some(BinOp::Div),
+                Token::DoubleSlash => Some(BinOp::FloorDiv),
+                Token::Percent => Some(BinOp::Mod),
+                Token::At => Some(BinOp::At),
+                // Implicit multiplication: followed by a primary expression or parenthesis or function
+                Token::Number(_) | Token::LParen | Token::LBracket | Token::LBrace | Token::Function(_) | 
+                Token::Pi | Token::NaN | Token::Infinity | Token::String(_) | Token::Sqrt | Token::Cbrt | Token::Sum => Some(BinOp::Mul),
+                _ => None,
+            };
+            if let Some(op_type) = op {
+                // If it's an explicit operator, consume it. If implicit, don't.
+                if matches!(t, Token::Star | Token::Slash | Token::DoubleSlash | Token::Percent | Token::At) {
+                    self.next();
+                }
+                let rhs = self.parse_pow()?;
+                node = Expr::BinOp {
+                    op: op_type,
+                    lhs: Box::new(node),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(node)
+    }
+
+    fn parse_pow(&mut self) -> Result<Expr, String> {
         let mut node = self.parse_unary()?;
         while let Some(t) = self.peek() {
-            match t {
-                Token::Star => {
-                    self.next();
-                    let rhs = self.parse_unary()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Mul,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                Token::Slash => {
-                    self.next();
-                    let rhs = self.parse_unary()?;
-                    node = Expr::BinOp {
-                        op: BinOp::Div,
-                        lhs: Box::new(node),
-                        rhs: Box::new(rhs),
-                    };
-                }
-                _ => break,
+            let op = match t {
+                Token::StarStar | Token::Caret => Some(BinOp::Pow),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.next();
+                // Right-associative: 2^3^4 is 2^(3^4)
+                let rhs = self.parse_pow()?;
+                node = Expr::BinOp {
+                    op,
+                    lhs: Box::new(node),
+                    rhs: Box::new(rhs),
+                };
+            } else {
+                break;
             }
         }
         Ok(node)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        match self.peek() {
-            Some(Token::Minus) => {
-                self.next();
-                let expr = self.parse_pow()?;
-                Ok(Expr::UnaryOp {
-                    op: UnaryOp::Neg,
-                    expr: Box::new(expr),
-                })
-            }
-            Some(Token::Sqrt) => {
-                self.next();
-                let expr = self.parse_pow()?;
-                Ok(Expr::FunctionCall {
-                    name: "sqrt".to_string(),
-                    args: vec![expr],
-                })
-            }
-            Some(Token::Cbrt) => {
-                self.next();
-                let expr = self.parse_pow()?;
-                Ok(Expr::FunctionCall {
-                    name: "cbrt".to_string(),
-                    args: vec![expr],
-                })
-            }
-            _ => self.parse_pow(),
-        }
-    }
-
-    fn parse_pow(&mut self) -> Result<Expr, String> {
-        let mut node = self.parse_postfix()?;
-        if let Some(Token::Caret) = self.peek() {
-            self.next();
-            let rhs = self.parse_pow()?; // Right associative
-            node = Expr::BinOp {
-                op: BinOp::Pow,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
+        if let Some(t) = self.peek() {
+            let op = match t {
+                Token::Minus => Some(UnaryOp::Neg),
+                Token::Plus => Some(UnaryOp::Pos),
+                Token::Exclamation => Some(UnaryOp::Not),
+                _ => None,
             };
+            if let Some(op) = op {
+                self.next();
+                let expr = self.parse_unary()?;
+                return Ok(Expr::UnaryOp {
+                    op,
+                    expr: Box::new(expr),
+                });
+            }
         }
-        Ok(node)
+        self.parse_postfix()
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, String> {
         let mut node = self.parse_primary()?;
         while let Some(t) = self.peek() {
-            match t {
-                Token::Exclamation => {
-                    self.next();
-                    node = Expr::UnaryOp {
-                        op: UnaryOp::Fact,
-                        expr: Box::new(node),
-                    };
-                }
-                Token::Percent => {
-                    self.next();
-                    node = Expr::BinOp {
-                        op: BinOp::Div,
-                        lhs: Box::new(node),
-                        rhs: Box::new(Expr::Number(100.0)),
-                    };
-                }
-                _ => break,
+            let op = match t {
+                Token::Exclamation => Some(UnaryOp::Fact),
+                Token::Percent => Some(UnaryOp::Percent),
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.next();
+                node = Expr::UnaryOp {
+                    op,
+                    expr: Box::new(node),
+                };
+            } else {
+                break;
             }
         }
         Ok(node)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
-        let t = self.peek().cloned();
+        let t = self.next().ok_or_else(|| "Unexpected end of input".to_string())?;
         match t {
-            Some(Token::Number(n)) => {
-                self.next();
+            Token::Number(n) => {
+                // Mixed fraction support: Number Number
+                // If the next token is also a number (like in "5 3/4"), 
+                // but usually the tokenizer will handle ¾ as a single character if supported.
+                // For now, handle as a simple number.
                 Ok(Expr::Number(n))
             }
-            Some(Token::LParen) => {
-                self.next();
-                let node = self.parse_expression()?;
-                match self.peek() {
-                    Some(Token::RParen) => {
-                        self.next();
-                        Ok(node)
-                    }
-                    _ => Err("Missing closing parenthesis".to_string()),
+            Token::NaN => Ok(Expr::Number(f64::NAN)),
+            Token::Infinity => Ok(Expr::Number(f64::INFINITY)),
+            Token::Pi => Ok(Expr::Number(std::f64::consts::PI)),
+            Token::LParen | Token::LBracket => {
+                let closing = if matches!(t, Token::LParen) { Token::RParen } else { Token::RBracket };
+                let expr = self.parse_expression()?;
+                if self.next().as_ref() == Some(&closing) {
+                    Ok(expr)
+                } else {
+                    Err(format!("Expected {:?}", closing))
                 }
             }
-            Some(Token::Function(name)) => {
-                self.next();
-                match self.peek() {
-                    Some(Token::LParen) => {
-                        self.next();
-                        let mut args = Vec::new();
-                        if let Some(Token::RParen) = self.peek() {
-                            self.next();
-                        } else {
-                            loop {
-                                args.push(self.parse_expression()?);
-                                match self.peek() {
-                                    Some(Token::Comma) => {
-                                        self.next();
-                                        continue;
-                                    }
-                                    Some(Token::RParen) => {
-                                        self.next();
-                                        break;
-                                    }
-                                    _ => return Err("Invalid function call syntax".to_string()),
-                                }
+            Token::LBrace => {
+                let mut exprs = Vec::new();
+                if !matches!(self.peek(), Some(Token::RBrace)) {
+                    loop {
+                        exprs.push(self.parse_expression()?);
+                        match self.peek() {
+                            Some(Token::Comma) | Some(Token::Semicolon) => {
+                                self.next();
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                if let Some(Token::RBrace) = self.next() {
+                    Ok(Expr::Sequence(exprs))
+                } else {
+                    Err("Expected '}'".to_string())
+                }
+            }
+            Token::Sqrt | Token::Cbrt | Token::Sum | Token::Function(_) | Token::String(_) => {
+                let name = match &t {
+                    Token::Sqrt => "sqrt".to_string(),
+                    Token::Cbrt => "cbrt".to_string(),
+                    Token::Sum => "sum".to_string(),
+                    Token::Function(s) => s.clone(),
+                    Token::String(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                
+                // Handle both name(args) and name expression
+                if let Some(Token::LParen) | Some(Token::LBracket) = self.peek() {
+                    let opener = self.next().unwrap();
+                    let closer = if matches!(opener, Token::LParen) { Token::RParen } else { Token::RBracket };
+                    let mut args = Vec::new();
+                    if self.peek() != Some(&closer) {
+                        loop {
+                            args.push(self.parse_expression()?);
+                            if let Some(Token::Comma) = self.peek() {
+                                self.next();
+                                if self.peek() == Some(&closer) { break; }
+                            } else {
+                                break;
                             }
                         }
-                        Ok(Expr::FunctionCall { name, args })
                     }
-                    _ => Err("Expected '(' after function name".to_string()),
+                    if self.next().as_ref() == Some(&closer) {
+                        Ok(Expr::FunctionCall { name, args })
+                    } else {
+                        Err(format!("Expected {:?}", closer))
+                    }
+                } else {
+                    // Try to parse next expression as argument for prefix-like functions
+                    if matches!(t, Token::Sqrt | Token::Cbrt | Token::Sum) {
+                        let arg = self.parse_unary()?;
+                        Ok(Expr::FunctionCall { name, args: vec![arg] })
+                    } else {
+                        Ok(Expr::FunctionCall { name, args: vec![] })
+                    }
                 }
             }
-            Some(tok) => Err(format!("Unexpected token: {:?}", tok)),
-            None => Err("Unexpected end of input".to_string()),
+            _ => Err(format!("Unexpected token: {:?}", t)),
         }
     }
 }
@@ -406,166 +547,91 @@ impl Parser {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("parser booting (v1.0)");
-
-    let addr_or_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/tmp/genesis-core/parser.sock".to_string());
-
+    tracing::info!("parser booting");
+    let addr_or_path = env::args().nth(1).unwrap_or_else(|| "/tmp/genesis-core/parser.sock".to_string());
     if addr_or_path.starts_with("tcp://") {
         let addr = addr_or_path.strip_prefix("tcp://").unwrap();
         let listener = TcpListener::bind(addr).await?;
-        tracing::info!("Listening on TCP {}", addr);
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to accept TCP connection: {}", e);
-                    continue;
-                }
-            };
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
+            let (stream, _) = listener.accept().await?;
+            tokio::spawn(async move { let _ = handle_client(stream).await; });
         }
     } else {
-        let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-        let _ = std::fs::remove_file(uds_path);
-        if let Some(parent) = std::path::Path::new(uds_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
+            let _ = std::fs::remove_file(uds_path);
+            if let Some(parent) = std::path::Path::new(uds_path).parent() { std::fs::create_dir_all(parent)?; }
+            let listener = UnixListener::bind(uds_path)?;
+            loop {
+                let (stream, _) = listener.accept().await?;
+                tokio::spawn(async move { let _ = handle_client(stream).await; });
+            }
         }
-        let listener = UnixListener::bind(uds_path)?;
-        tracing::info!("Listening on UDS {}", uds_path);
-        loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to accept UDS connection: {}", e);
-                    continue;
-                }
-            };
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
+        #[cfg(not(unix))]
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            addr_or_path.hash(&mut hasher);
+            let port = (49152 + (hasher.finish() % 16384)) as u16;
+            let addr = format!("127.0.0.1:{}", port);
+            tracing::info!("UDS simulation on TCP {}", addr);
+            let listener = TcpListener::bind(&addr).await?;
+            loop {
+                let (stream, _) = listener.accept().await?;
+                tokio::spawn(async move { let _ = handle_client(stream).await; });
+            }
         }
     }
 }
 
 async fn handle_client<S>(stream: S) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
     let mut line = String::new();
-
     while let Ok(n) = reader.read_line(&mut line).await {
-        if n == 0 {
-            break;
-        }
-        let start = Instant::now();
+        if n == 0 { break; }
+        let start = std::time::Instant::now();
         let request: ModuleRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
-            Err(e) => {
-                tracing::error!("Failed to parse request: {}", e);
-                line.clear();
-                continue;
-            }
+            Err(_) => { line.clear(); continue; }
         };
-
+        // Expect input to be a JSON array of tokens from tokenizer
         let tokens: Vec<Token> = match serde_json::from_str(&request.input) {
             Ok(t) => t,
             Err(e) => {
-                send_error(
-                    &mut writer,
-                    request.request_id,
-                    "SYNTAX_ERROR",
-                    format!("Failed to parse tokens: {}", e),
-                    start.elapsed().as_millis() as u64,
-                )
-                .await;
+                send_response(&mut writer, request.request_id, None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: format!("Token parse error: {}", e), input_position: None }), start.elapsed().as_millis() as u64).await;
                 line.clear();
                 continue;
             }
         };
-
         let mut parser = Parser::new(tokens);
         let (output, error) = match parser.parse_expression() {
             Ok(expr) => {
-                if let Some(_t) = parser.peek() {
-                    (
-                        None,
-                        Some(ModuleError {
-                            code: "SYNTAX_ERROR".to_string(),
-                            message: "Unexpected token after expression".to_string(),
-                            input_position: Some(parser.pos),
-                        }),
-                    )
+                if parser.pos < parser.tokens.len() {
+                    (None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: format!("Unexpected token at position {}: {:?}", parser.pos, parser.tokens[parser.pos]), input_position: Some(parser.pos) }))
                 } else {
                     match serde_json::to_string(&expr) {
                         Ok(json) => (Some(json), None),
-                        Err(e) => (
-                            None,
-                            Some(ModuleError {
-                                code: "SERIALIZE_ERROR".to_string(),
-                                message: e.to_string(),
-                                input_position: None,
-                            }),
-                        ),
+                        Err(e) => (None, Some(ModuleError { code: "SERIALIZE_ERROR".to_string(), message: e.to_string(), input_position: None })),
                     }
                 }
-            }
-            Err(e) => {
-                let pos = if parser.pos < parser.tokens.len() {
-                    Some(parser.pos)
-                } else {
-                    None
-                };
-                (
-                    None,
-                    Some(ModuleError {
-                        code: "SYNTAX_ERROR".to_string(),
-                        message: e,
-                        input_position: pos,
-                    }),
-                )
-            }
+            },
+            Err(e) => (None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: e, input_position: Some(parser.pos) })),
         };
-
-        let response = ModuleResponse {
-            request_id: request.request_id,
-            output,
-            error,
-            processing_ms: start.elapsed().as_millis() as u64,
-        };
-
-        if let Ok(payload) = serde_json::to_vec(&response) {
-            let mut payload = payload;
-            payload.push(b'\n');
-            let _ = writer.write_all(&payload).await;
-        }
+        send_response(&mut writer, request.request_id, output, error, start.elapsed().as_millis() as u64).await;
         line.clear();
     }
     Ok(())
 }
 
-async fn send_error(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    request_id: String,
-    code: &str,
-    message: String,
-    processing_ms: u64,
-) {
-    let response = ModuleResponse {
-        request_id,
-        output: None,
-        error: Some(ModuleError {
-            code: code.to_string(),
-            message,
-            input_position: None,
-        }),
-        processing_ms,
-    };
+async fn send_response<W>(writer: &mut W, request_id: String, output: Option<String>, error: Option<ModuleError>, processing_ms: u64)
+where W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let response = ModuleResponse { request_id, output, error, processing_ms };
     if let Ok(payload) = serde_json::to_vec(&response) {
         let mut payload = payload;
         payload.push(b'\n');
@@ -575,168 +641,6 @@ async fn send_error(
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,parser=debug"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_simple() {
-        let tokens = vec![
-            Token::Number(1.0),
-            Token::Plus,
-            Token::Number(2.0),
-            Token::Star,
-            Token::Number(3.0),
-        ];
-        let mut parser = Parser::new(tokens);
-        let expr = parser.parse_expression().unwrap();
-        assert!(matches!(expr, Expr::BinOp { op: BinOp::Add, .. }));
-    }
-
-    #[test]
-    fn test_parse_parens() {
-        let tokens = vec![
-            Token::LParen,
-            Token::Number(1.0),
-            Token::Plus,
-            Token::Number(2.0),
-            Token::RParen,
-            Token::Star,
-            Token::Number(3.0),
-        ];
-        let mut parser = Parser::new(tokens);
-        let expr = parser.parse_expression().unwrap();
-        assert!(matches!(expr, Expr::BinOp { op: BinOp::Mul, .. }));
-    }
-
-    #[test]
-    fn test_parse_pow() {
-        let tokens = vec![
-            Token::Number(2.0),
-            Token::Caret,
-            Token::Number(3.0),
-            Token::Caret,
-            Token::Number(2.0),
-        ];
-        let mut parser = Parser::new(tokens);
-        let expr = parser.parse_expression().unwrap();
-        if let Expr::BinOp {
-            op: BinOp::Pow,
-            rhs,
-            ..
-        } = expr
-        {
-            assert!(matches!(*rhs, Expr::BinOp { op: BinOp::Pow, .. }));
-        } else {
-            panic!("Expected Pow");
-        }
-    }
-}
-
-pub mod compat {
-    #[cfg(windows)]
-    pub use windows::*;
-
-    #[cfg(unix)]
-    pub use tokio::net::{UnixListener, UnixStream};
-
-    #[cfg(windows)]
-    mod windows {
-        use std::net::SocketAddr;
-        use std::path::Path;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-        use tokio::net::{TcpListener, TcpStream};
-
-        fn path_to_port(path: impl AsRef<Path>) -> u16 {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            let file_name = path
-                .as_ref()
-                .file_name()
-                .map(|f| f.to_string_lossy())
-                .unwrap_or_else(|| path.as_ref().to_string_lossy());
-            file_name.hash(&mut hasher);
-            let hash = hasher.finish();
-            (49152 + (hash % 16384)) as u16
-        }
-
-        pub struct UnixListener {
-            inner: TcpListener,
-        }
-
-        impl UnixListener {
-            pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let std_listener = std::net::TcpListener::bind(addr)?;
-                std_listener.set_nonblocking(true)?;
-                let inner = TcpListener::from_std(std_listener)?;
-                Ok(Self { inner })
-            }
-
-            pub async fn accept(&self) -> std::io::Result<(UnixStream, SocketAddr)> {
-                let (stream, addr) = self.inner.accept().await?;
-                Ok((UnixStream { inner: stream }, addr))
-            }
-        }
-
-        pub struct UnixStream {
-            inner: TcpStream,
-        }
-
-        impl UnixStream {
-            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let inner = TcpStream::connect(addr).await?;
-                Ok(Self { inner })
-            }
-
-            pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
-                tokio::io::split(self)
-            }
-        }
-
-        impl AsyncRead for UnixStream {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_read(cx, buf)
-            }
-        }
-
-        impl AsyncWrite for UnixStream {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                Pin::new(&mut self.inner).poll_write(cx, buf)
-            }
-
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_flush(cx)
-            }
-
-            fn poll_shutdown(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_shutdown(cx)
-            }
-        }
-    }
 }

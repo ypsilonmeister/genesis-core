@@ -27,11 +27,13 @@ mod process;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -281,7 +283,7 @@ async fn main() -> Result<()> {
                             let swapper =
                                 HotSwapper::new(&m_cfg.name, &m_cfg.binary, &m_cfg.socket);
 
-                            let (outcome, new_child) = cmp
+                            let (outcome, new_child) = match cmp
                                 .maybe_repair(RepairContext {
                                     error_code: &error_code,
                                     error_count: *count,
@@ -291,7 +293,23 @@ async fn main() -> Result<()> {
                                     old_child: proc.child,
                                     metadata: &metadata,
                                 })
-                                .await?;
+                                .await
+                            {
+                                Ok(res) => res,
+                                Err(e) => {
+                                    error!(module = %m_cfg.name, err = %e, "Tier 1 repair failed unexpectedly - module process lost");
+                                    // If we hit an internal error, we can't easily recover the child.
+                                    // For now, we return a "ModuleCrash" outcome and a dummy handle or just exit.
+                                    // A better fix would be to re-spawn the old binary.
+                                    let restarted_child = Command::new(&m_cfg.binary)
+                                        .arg(&m_cfg.socket)
+                                        .stdout(Stdio::null())
+                                        .stderr(Stdio::null())
+                                        .spawn()
+                                        .context("Failed to restart module after internal repair error")?;
+                                    (RepairOutcome::Rejected { reason: format!("Internal error: {}", e) }, restarted_child)
+                                }
+                            };
 
                             let mod_name_t1 = m_cfg.name.clone();
                             let new_proc = ModuleProcess {
@@ -349,7 +367,7 @@ async fn main() -> Result<()> {
                         .collect();
                     let examples: Vec<String> = unknown_pattern_examples.iter().cloned().collect();
 
-                    let outcome = cmp
+                    let outcome = match cmp
                         .maybe_tier2(Tier2Context {
                             unknown_inputs: &examples,
                             chain_module_names: &names,
@@ -358,7 +376,14 @@ async fn main() -> Result<()> {
                             tier2_trigger,
                             metadata: &metadata,
                         })
-                        .await?;
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(e) => {
+                            error!(err = %e, "Tier 2 repair failed unexpectedly");
+                            Tier2Outcome::Rejected { reason: format!("Internal error: {}", e) }
+                        }
+                    };
 
                     match outcome {
                         Tier2Outcome::Extended { module_name } => {
@@ -380,7 +405,25 @@ async fn main() -> Result<()> {
                                         };
                                         processes.insert(idx, (m_cfg, new_proc));
                                     }
-                                    Err(e) => warn!(err = %e, "Tier 2 hot_swap failed"),
+                                    Err(e) => {
+                                        warn!(err = %e, "Tier 2 hot_swap failed, attempting to restart from binary");
+                                        let restarted_child = Command::new(&m_cfg.binary)
+                                            .arg(&m_cfg.socket)
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null())
+                                            .spawn();
+                                        
+                                        match restarted_child {
+                                            Ok(c) => {
+                                                let new_proc = ModuleProcess {
+                                                    name: m_cfg.name.clone(),
+                                                    child: c,
+                                                };
+                                                processes.insert(idx, (m_cfg, new_proc));
+                                            }
+                                            Err(e2) => error!(err = %e2, "Failed to restart module after hot_swap failure"),
+                                        }
+                                    }
                                 }
                                 // §5 把握テスト (Tier 2 extend)
                                 let sp = format!("modules/{}/src/main.rs", module_name);
@@ -397,31 +440,36 @@ async fn main() -> Result<()> {
                         Tier2Outcome::NewModule(spec) => {
                             let new_mod_name = spec.name.clone();
                             let new_mod_src = format!("modules/{}/src/main.rs", new_mod_name);
-                            spawn_and_insert_module(&mut processes, spec).await?;
-                            error_counts.remove("UnknownPattern");
-                            unknown_pattern_examples.clear();
+                            match spawn_and_insert_module(&mut processes, spec).await {
+                                Ok(_) => {
+                                    info!(module = %new_mod_name, "Tier 2: new module adopted");
+                                    error_counts.remove("UnknownPattern");
+                                    unknown_pattern_examples.clear();
 
-                            // chain.toml を永続化
-                            let mut new_config = ChainConfig {
-                                modules: Vec::new(),
-                            };
-                            for (m_spec, _) in &processes {
-                                new_config.modules.push(m_spec.clone());
-                            }
-                            if let Err(e) = new_config.save(chain_path) {
-                                error!(err = %e, "Failed to persist chain.toml");
-                            } else {
-                                info!("chain.toml persisted with new module");
-                            }
+                                    // chain.toml を永続化
+                                    let mut new_config = ChainConfig {
+                                        modules: Vec::new(),
+                                    };
+                                    for (m_spec, _) in &processes {
+                                        new_config.modules.push(m_spec.clone());
+                                    }
+                                    if let Err(e) = new_config.save(chain_path) {
+                                        error!(err = %e, "Failed to persist chain.toml");
+                                    } else {
+                                        info!("chain.toml persisted with new module");
+                                    }
 
-                            // §5 把握テスト (Tier 2 new module)
-                            if let Ok(code) = std::fs::read_to_string(&new_mod_src) {
-                                if let Err(e) = cmp
-                                    .run_comprehension_test(&new_mod_name, &code, &metadata)
-                                    .await
-                                {
-                                    warn!(err = %e, "comprehension test failed (tier2 new)");
+                                    // §5 把握テスト (Tier 2 new module)
+                                    if let Ok(code) = std::fs::read_to_string(&new_mod_src) {
+                                        if let Err(e) = cmp
+                                            .run_comprehension_test(&new_mod_name, &code, &metadata)
+                                            .await
+                                        {
+                                            warn!(err = %e, "comprehension test failed (tier2 new)");
+                                        }
+                                    }
                                 }
+                                Err(e) => error!(err = %e, "Failed to spawn new module"),
                             }
                         }
                         Tier2Outcome::Rejected { reason } => {
@@ -470,9 +518,6 @@ async fn spawn_and_insert_module(
     processes: &mut Vec<(ModuleSpec, ModuleProcess)>,
     spec: NewModuleSpec,
 ) -> Result<()> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
     info!(name = %spec.name, "Tier 2: spawning new module");
 
     // chain 内の挿入位置を決定
@@ -486,7 +531,13 @@ async fn spawn_and_insert_module(
         0
     };
 
-    let child = Command::new(&spec.binary_path)
+    let binary_path = if cfg!(windows) && !spec.binary_path.ends_with(".exe") {
+        format!("{}.exe", spec.binary_path)
+    } else {
+        spec.binary_path.clone()
+    };
+
+    let child = Command::new(&binary_path)
         .arg(&spec.socket_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
