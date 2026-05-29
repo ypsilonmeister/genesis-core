@@ -128,6 +128,8 @@ pub enum Token {
 #[serde(tag = "type", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Expr {
     Number(f64),
+    Infinity,
+    NaN,
     Variable(String),
     BinOp {
         op: BinOp,
@@ -251,7 +253,8 @@ impl Parser {
         matches!(t,
             Token::Function(_) | Token::Sin | Token::Cos | Token::Tan |
             Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt |
-            Token::Cbrt | Token::Sum | Token::Asin | Token::Acos | Token::Atan | Token::Sinh | Token::Cosh | Token::Tanh
+            Token::Cbrt | Token::Sum | Token::Asin | Token::Acos | Token::Atan | Token::Sinh | Token::Cosh | Token::Tanh |
+            Token::Mod | Token::Pow | Token::Integral | Token::Differential(_)
         )
     }
 
@@ -276,6 +279,10 @@ impl Parser {
             Token::Sinh => "sinh".to_string(),
             Token::Cosh => "cosh".to_string(),
             Token::Tanh => "tanh".to_string(),
+            Token::Mod => "mod".to_string(),
+            Token::Pow => "pow".to_string(),
+            Token::Integral => "integral".to_string(),
+            Token::Differential(s) => format!("diff_{}", s),
             _ => format!("{:?}", t).to_lowercase(),
         }
     }
@@ -288,7 +295,7 @@ impl Parser {
             Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt |
             Token::Cbrt | Token::Sum | Token::String(_) | Token::I | Token::J | Token::Imaginary(_) |
             Token::Integral | Token::Differential(_) | Token::Asin | Token::Acos | Token::Atan |
-            Token::Sinh | Token::Cosh | Token::Tanh
+            Token::Sinh | Token::Cosh | Token::Tanh | Token::Dot
         )
     }
 
@@ -576,7 +583,7 @@ impl Parser {
                 if matches!(t, Token::Star) {
                     self.next();
                 }
-                let rhs = self.parse_power()?; // right-associative
+                let rhs = self.parse_power()?;
                 return Ok(Expr::BinOp {
                     op,
                     lhs: Box::new(node),
@@ -639,14 +646,17 @@ impl Parser {
 
     fn parse_primary(&self) -> std::result::Result<Expr, String> {
         let _guard = self.check_depth()?;
-        let t = self.next().ok_or("Unexpected end of tokens")?;
+        let t = match self.next() {
+            Some(t) => t,
+            None => return Err("Unexpected end of input".to_string()),
+        };
         
         match &t {
             Token::Number(n) => Ok(Expr::Number(*n)),
             Token::Pi => Ok(Expr::Number(std::f64::consts::PI)),
             Token::E => Ok(Expr::Number(std::f64::consts::E)),
-            Token::Infinity => Ok(Expr::Number(f64::INFINITY)),
-            Token::NaN => Ok(Expr::Number(f64::NAN)),
+            Token::Infinity => Ok(Expr::Infinity),
+            Token::NaN => Ok(Expr::NaN),
             Token::I => Ok(Expr::Variable("i".to_string())),
             Token::J => Ok(Expr::Variable("j".to_string())),
             Token::Imaginary(n) => Ok(Expr::BinOp {
@@ -654,7 +664,22 @@ impl Parser {
                 lhs: Box::new(Expr::Number(*n)),
                 rhs: Box::new(Expr::Variable("i".to_string())),
             }),
-            Token::String(s) => Ok(Expr::Variable(s.clone())),
+            Token::String(s) => {
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    self.parse_function_call(s.clone())
+                } else {
+                    self.handle_constant_or_var(s.clone())
+                }
+            }
+            Token::Dot => {
+                if let Some(Token::Number(n)) = self.peek() {
+                    self.next();
+                    let val = format!("0.{}", n);
+                    Ok(Expr::Number(val.parse::<f64>().unwrap_or(*n)))
+                } else {
+                    Ok(Expr::Number(0.0))
+                }
+            }
             Token::LParen | Token::LBracket | Token::LBrace => {
                 let closing = match t {
                     Token::LParen => Token::RParen,
@@ -663,35 +688,54 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let node = self.parse_expression()?;
-                if self.next() != Some(closing.clone()) {
-                    return Err(format!("Expected {:?}", closing));
+                match self.next() {
+                    Some(ref ct) if ct == &closing => Ok(node),
+                    Some(ref ct) => Err(format!("Mismatched parentheses: expected {:?}, found {:?}", closing, ct)),
+                    None => Err(format!("Mismatched parentheses: expected {:?}, but input ended", closing)),
                 }
-                Ok(node)
             }
             _ if self.is_function_like(&t) => {
                 let name = self.token_to_function_name(&t);
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.parse_function_call(name)
-                } else {
-                    // Check if it's a known constant/keyword first
-                    match name.to_lowercase().as_str() {
-                        "pi" | "π" => Ok(Expr::Number(std::f64::consts::PI)),
-                        "e" => Ok(Expr::Number(std::f64::consts::E)),
-                        "inf" | "infinity" | "∞" => Ok(Expr::Number(f64::INFINITY)),
-                        "nan" => Ok(Expr::Number(f64::NAN)),
-                        "i" | "j" => Ok(Expr::Variable(name.to_lowercase())),
-                        _ => Ok(Expr::Variable(name)),
+                } else if let Some(next_t) = self.peek() {
+                    if self.can_start_expr(next_t) {
+                        match self.parse_unary() {
+                            Ok(arg) => {
+                                match name.to_lowercase().as_str() {
+                                    "sqrt" => Ok(Expr::Sqrt { expr: Box::new(arg) }),
+                                    "log" | "ln" => Ok(Expr::Log { expr: Box::new(arg), base: None }),
+                                    _ => Ok(Expr::FunctionCall { name, args: vec![arg] }),
+                                }
+                            }
+                            Err(_) => self.handle_constant_or_var(name),
+                        }
+                    } else {
+                        self.handle_constant_or_var(name)
                     }
+                } else {
+                    self.handle_constant_or_var(name)
                 }
             }
             _ => Err(format!("Unexpected token in primary: {:?}", t)),
         }
     }
 
+    fn handle_constant_or_var(&self, name: String) -> std::result::Result<Expr, String> {
+        match name.to_lowercase().as_str() {
+            "pi" | "π" => Ok(Expr::Number(std::f64::consts::PI)),
+            "e" => Ok(Expr::Number(std::f64::consts::E)),
+            "inf" | "infinity" | "∞" => Ok(Expr::Infinity),
+            "nan" => Ok(Expr::NaN),
+            "i" | "j" => Ok(Expr::Variable(name.to_lowercase())),
+            _ => Ok(Expr::Variable(name)),
+        }
+    }
+
     fn parse_function_call(&self, name: String) -> std::result::Result<Expr, String> {
         self.next(); // consume '('
         let mut args = Vec::new();
-        if !matches!(self.peek(), Some(Token::RParen)) {
+        if !matches!(self.peek(), Some(Token::RParen)) && self.peek().is_some() {
             args.push(self.parse_assign()?);
             while matches!(self.peek(), Some(Token::Comma)) {
                 self.next();
@@ -699,38 +743,36 @@ impl Parser {
             }
         }
         if self.next() != Some(Token::RParen) {
-            return Err("Expected ')' after function arguments".to_string());
+            return Err("Expected closing parenthesis in function call".to_string());
         }
         
-        // Automatic translation as requested in markdown
         match name.to_lowercase().as_str() {
             "log10" => {
-                if args.len() != 1 { return Err("log10 requires exactly 1 argument".to_string()); }
+                if args.is_empty() { return Err("log10 requires an argument".to_string()); }
                 Ok(Expr::Log {
                     expr: Box::new(args.remove(0)),
                     base: Some(Box::new(Expr::Number(10.0))),
                 })
             }
             "log2" => {
-                if args.len() != 1 { return Err("log2 requires exactly 1 argument".to_string()); }
+                if args.is_empty() { return Err("log2 requires an argument".to_string()); }
                 Ok(Expr::Log {
                     expr: Box::new(args.remove(0)),
                     base: Some(Box::new(Expr::Number(2.0))),
                 })
             }
             "log" | "ln" => {
+                if args.is_empty() { return Err("log requires an argument".to_string()); }
                 if args.len() == 1 {
                     Ok(Expr::Log { expr: Box::new(args.remove(0)), base: None })
-                } else if args.len() == 2 {
+                } else {
                     let expr = args.remove(0);
                     let base = args.remove(0);
                     Ok(Expr::Log { expr: Box::new(expr), base: Some(Box::new(base)) })
-                } else {
-                    Err("log requires 1 or 2 arguments".to_string())
                 }
             }
             "sqrt" => {
-                if args.len() != 1 { return Err("sqrt requires exactly 1 argument".to_string()); }
+                if args.is_empty() { return Err("sqrt requires an argument".to_string()); }
                 Ok(Expr::Sqrt { expr: Box::new(args.remove(0)) })
             }
             _ => Ok(Expr::FunctionCall { name, args }),
@@ -797,13 +839,25 @@ async fn main() -> Result<()> {
                         let parser = Parser::new(tokens);
                         let (output, error) = match parser.parse_expression() {
                             Ok(expr) => {
-                                if parser.pos.get() < parser.tokens.len() {
+                                let mut has_real_trailing = false;
+                                let pos = parser.pos.get();
+                                for i in pos..parser.tokens.len() {
+                                    match &parser.tokens[i] {
+                                        Token::Semicolon | Token::Comma => {}
+                                        _ => {
+                                            has_real_trailing = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if has_real_trailing {
                                     (
                                         None,
                                         Some(ModuleError {
                                             code: "UNKNOWN_PATTERN".to_string(),
-                                            message: format!("Unexpected token at end: {:?}", parser.tokens.get(parser.pos.get())),
-                                            input_position: Some(parser.pos.get()),
+                                            message: format!("Trailing tokens at position {}", pos),
+                                            input_position: Some(pos),
                                         }),
                                     )
                                 } else {
@@ -833,9 +887,7 @@ async fn main() -> Result<()> {
                         if let Ok(payload) = serde_json::to_vec(&response) {
                             let mut payload = payload;
                             payload.push(b'\n');
-                            if writer.write_all(&payload).await.is_err() {
-                                break;
-                            }
+                            let _ = writer.write_all(&payload).await;
                         }
                     }
                     Err(_) => break,
@@ -890,7 +942,15 @@ pub mod compat {
             pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
                 let port = path_to_port(path);
                 let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let std_listener = std::net::TcpListener::bind(addr)?;
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM,
+                    None,
+                )?;
+                socket.set_reuse_address(true)?;
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let std_listener: std::net::TcpListener = socket.into();
                 let inner = TcpListener::from_std(std_listener)?;
                 Ok(Self { inner })
             }

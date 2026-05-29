@@ -155,7 +155,15 @@ pub mod compat {
             pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
                 let port = path_to_port(path);
                 let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let std_listener = std::net::TcpListener::bind(addr)?;
+                let socket = socket2::Socket::new(
+                    socket2::Domain::IPV4,
+                    socket2::Type::STREAM,
+                    None,
+                )?;
+                socket.set_reuse_address(true)?;
+                socket.bind(&addr.into())?;
+                socket.listen(128)?;
+                let std_listener: std::net::TcpListener = socket.into();
                 std_listener.set_nonblocking(true)?;
                 let inner = TcpListener::from_std(std_listener)?;
                 Ok(Self { inner })

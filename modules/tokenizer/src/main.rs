@@ -18,7 +18,7 @@
 //   Isolate lexical analysis.
 // =============================================================================
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -176,7 +176,7 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     chars.next();
                     tokens.push(Token::Ne);
                 } else {
-                    tokens.push(Token::Exclamation);
+                    tokens.push(Token::Factorial);
                 }
             }
             '?' => tokens.push(Token::Question),
@@ -185,6 +185,18 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                 if chars.peek().map_or(false, |&(_, next_c)| next_c == '.') {
                     chars.next();
                     tokens.push(Token::DotDot);
+                } else if chars.peek().map_or(false, |&(_, next_c)| next_c.is_ascii_digit()) {
+                    let mut s = String::from("0.");
+                    while let Some(&(_, next_c)) = chars.peek() {
+                        if next_c.is_ascii_digit() || next_c == '_' {
+                            let nc = chars.next().unwrap().1;
+                            if nc != '_' { s.push(nc); }
+                        } else {
+                            break;
+                        }
+                    }
+                    let n: f64 = s.parse().map_err(|e| (format!("Invalid number: {}", e), i))?;
+                    tokens.push(Token::Number(n));
                 } else {
                     tokens.push(Token::Dot);
                 }
@@ -219,7 +231,7 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     tokens.push(Token::Gt);
                 }
             }
-            '%' => tokens.push(Token::Percent),
+            '%' => tokens.push(Token::Mod),
             ';' => tokens.push(Token::Semicolon),
             '√' => tokens.push(Token::Sqrt),
             '∛' => tokens.push(Token::Cbrt),
@@ -260,12 +272,26 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                 tokens.push(Token::String(s));
             }
             '0'..='9' => {
-                let mut s = String::from(c);
+                let mut s = String::new();
+                let mut base = 10;
+                
+                if c == '0' {
+                    match chars.peek() {
+                        Some(&(_, 'x')) | Some(&(_, 'X')) => { base = 16; chars.next(); }
+                        Some(&(_, 'o')) | Some(&(_, 'O')) => { base = 8; chars.next(); }
+                        Some(&(_, 'b')) | Some(&(_, 'B')) => { base = 2; chars.next(); }
+                        _ => { s.push('0'); }
+                    }
+                } else {
+                    s.push(c);
+                }
+
                 let mut has_dot = false;
                 while let Some(&(_, next_c)) = chars.peek() {
-                    if next_c.is_ascii_digit() {
-                        s.push(chars.next().unwrap().1);
-                    } else if next_c == '.' && !has_dot {
+                    if next_c.is_digit(base) || next_c == '_' {
+                        let nc = chars.next().unwrap().1;
+                        if nc != '_' { s.push(nc); }
+                    } else if next_c == '.' && !has_dot && base == 10 {
                         let mut temp_chars = chars.clone();
                         temp_chars.next();
                         if temp_chars.peek().map_or(false, |&(_, next_next_c)| next_next_c == '.') {
@@ -278,45 +304,49 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     }
                 }
                 
-                if let Some(&(_, next_c)) = chars.peek() {
-                    if next_c == 'e' || next_c == 'E' {
-                        let mut temp_chars = chars.clone();
-                        temp_chars.next();
-                        let mut valid_e = false;
+                if base == 10 {
+                    if let Some(&(_, 'e')) | Some(&(_, 'E')) = chars.peek() {
+                        let mut temp = chars.clone();
+                        temp.next(); // consume e/E
                         let mut s_e = String::new();
-                        if let Some(&(_, sign_c)) = temp_chars.peek() {
-                            if sign_c == '+' || sign_c == '-' {
-                                s_e.push(temp_chars.next().unwrap().1);
+                        if let Some(&(_, sign)) = temp.peek() {
+                            if sign == '+' || sign == '-' {
+                                s_e.push(temp.next().unwrap().1);
                             }
                         }
-                        while let Some(&(_, digit_c)) = temp_chars.peek() {
-                            if digit_c.is_ascii_digit() {
-                                s_e.push(temp_chars.next().unwrap().1);
-                                valid_e = true;
+                        let mut valid_e = false;
+                        while let Some(&(_, next_digit)) = temp.peek() {
+                            if next_digit.is_ascii_digit() || next_digit == '_' {
+                                let nc = temp.next().unwrap().1;
+                                if nc != '_' { s_e.push(nc); valid_e = true; }
                             } else {
                                 break;
                             }
                         }
                         if valid_e {
-                            let _ = chars.next(); // consume 'e'/'E'
-                            s.push(next_c);
+                            let e_char = chars.next().unwrap().1;
+                            s.push(e_char);
                             s.push_str(&s_e);
-                            for _ in 0..s_e.chars().count() { let _ = chars.next(); }
+                            chars = temp; 
                         }
                     }
                 }
 
-                if let Some(&(_, 'i')) = chars.peek() {
-                    chars.next();
-                    let n: f64 = s.parse().map_err(|e| (format!("Invalid number: {}", e), i))?;
-                    if n.is_nan() { tokens.push(Token::NaN); }
-                    else if n.is_infinite() { tokens.push(Token::Infinity); }
-                    else { tokens.push(Token::Imaginary(n)); }
+                let val = if base == 10 {
+                    s.parse::<f64>().map_err(|e| (format!("Invalid number: {}", e), i))?
                 } else {
-                    let n: f64 = s.parse().map_err(|e| (format!("Invalid number: {}", e), i))?;
-                    if n.is_nan() { tokens.push(Token::NaN); }
-                    else if n.is_infinite() { tokens.push(Token::Infinity); }
-                    else { tokens.push(Token::Number(n)); }
+                    u64::from_str_radix(&s, base).map_err(|e| (format!("Invalid integer: {}", e), i))? as f64
+                };
+
+                if let Some(&(_, 'i')) | Some(&(_, 'j')) = chars.peek() {
+                    chars.next();
+                    if val.is_nan() { tokens.push(Token::NaN); }
+                    else if val.is_infinite() { tokens.push(Token::Infinity); }
+                    else { tokens.push(Token::Imaginary(val)); }
+                } else {
+                    if val.is_nan() { tokens.push(Token::NaN); }
+                    else if val.is_infinite() { tokens.push(Token::Infinity); }
+                    else { tokens.push(Token::Number(val)); }
                 }
             }
             _ if is_identifier_start(c) => {
@@ -353,12 +383,14 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     "cbrt" | "∛" => Token::Cbrt,
                     "sum" => Token::Sum,
                     "integral" => Token::Integral,
-                    "mod" => Token::Mod,
-                    "pow" => Token::Pow,
+                    "mod" | "rem" => Token::Mod,
+                    "pow" | "power" => Token::Pow,
+                    "xor" => Token::BitXor,
+                    "and" => Token::LogicalAnd,
+                    "or" => Token::LogicalOr,
                     "i" => Token::I,
                     "j" => Token::J,
                     _ => {
-                        // Safe slicing: identifiers starting with 'd' or 'D' are 1-byte
                         if s_lower.starts_with('d') && s_lower.len() > 1 {
                              Token::Differential(s[1..].to_string())
                         } else {
@@ -390,11 +422,7 @@ fn path_to_port(path: impl AsRef<std::path::Path>) -> u16 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    let file_name = path
-        .as_ref()
-        .file_name()
-        .map(|f| f.to_string_lossy())
-        .unwrap_or_else(|| path.as_ref().to_string_lossy());
+    let file_name = path.as_ref().file_name().map(|f| f.to_string_lossy()).unwrap_or_else(|| path.as_ref().to_string_lossy());
     file_name.hash(&mut hasher);
     let hash = hasher.finish();
     (10000 + (hash % 35000)) as u16
@@ -408,16 +436,12 @@ async fn main() -> Result<()> {
     let addr_or_path = env::args().nth(1).unwrap_or_else(|| "/tmp/genesis-core/tokenizer.sock".to_string());
 
     if addr_or_path.starts_with("tcp://") {
-        let addr_str = addr_or_path.strip_prefix("tcp://").unwrap();
-        let listener = TcpListener::bind(addr_str).await?;
+        let addr_str = addr_or_path.strip_prefix("tcp://").context("Invalid TCP address format")?;
+        let listener = TcpListener::bind(addr_str).await.context(format!("Failed to bind to TCP {}", addr_str))?;
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(async move { let _ = handle_client(stream).await; });
-                }
-                Err(e) => {
-                    tracing::error!("accept error: {}", e);
-                }
+                Ok((stream, _)) => { tokio::spawn(async move { let _ = handle_client(stream).await; }); }
+                Err(e) => { tracing::error!("accept error: {}", e); }
             }
         }
     } else {
@@ -425,18 +449,12 @@ async fn main() -> Result<()> {
         {
             let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
             let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let listener = UnixListener::bind(uds_path)?;
+            if let Some(parent) = std::path::Path::new(uds_path).parent() { let _ = std::fs::create_dir_all(parent); }
+            let listener = UnixListener::bind(uds_path).context(format!("Failed to bind to UDS {}", uds_path))?;
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => {
-                        tokio::spawn(async move { let _ = handle_client(stream).await; });
-                    }
-                    Err(e) => {
-                        tracing::error!("accept error: {}", e);
-                    }
+                    Ok((stream, _)) => { tokio::spawn(async move { let _ = handle_client(stream).await; }); }
+                    Err(e) => { tracing::error!("accept error: {}", e); }
                 }
             }
         }
@@ -445,16 +463,22 @@ async fn main() -> Result<()> {
             let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
             let port = path_to_port(uds_path);
             let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            let listener = TcpListener::bind(&addr).await?;
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                None,
+            )?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&addr.into())?;
+            socket.listen(128)?;
+            let std_listener: std::net::TcpListener = socket.into();
+            std_listener.set_nonblocking(true)?;
+            let listener = TcpListener::from_std(std_listener)?;
             tracing::info!("tokenizer listening on TCP {}", addr);
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => {
-                        tokio::spawn(async move { let _ = handle_client(stream).await; });
-                    }
-                    Err(e) => {
-                        tracing::error!("accept error: {}", e);
-                    }
+                    Ok((stream, _)) => { tokio::spawn(async move { let _ = handle_client(stream).await; }); }
+                    Err(e) => { tracing::error!("accept error: {}", e); }
                 }
             }
         }
@@ -480,7 +504,7 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
                     }
                 };
 
-                let request_id = request_val["request_id"].as_str().unwrap_or("unknown").to_string();
+                let request_id = request_val["request_id"].as_str().map(|s| s.to_string()).unwrap_or_else(|| request_val["request_id"].to_string());
                 let input = match request_val["input"].as_str() {
                     Some(s) => s,
                     None => {
@@ -492,16 +516,12 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
                 match tokenize(input) {
                     Ok(tokens) => {
                         match serde_json::to_string(&tokens) {
-                            Ok(output) => {
-                                send_response(&mut writer, request_id, Some(output), None, start.elapsed().as_millis() as u64).await;
-                            }
-                            Err(e) => {
-                                send_response(&mut writer, request_id, None, Some(ModuleError { code: "SERIALIZATION_ERROR".to_string(), message: e.to_string(), input_position: None }), start.elapsed().as_millis() as u64).await;
-                            }
+                            Ok(output) => { send_response(&mut writer, request_id, Some(output), None, start.elapsed().as_millis() as u64).await; }
+                            Err(e) => { send_response(&mut writer, request_id, None, Some(ModuleError { code: "SERIALIZATION_ERROR".to_string(), message: e.to_string(), input_position: None }), start.elapsed().as_millis() as u64).await; }
                         }
                     }
                     Err((msg, pos)) => {
-                        send_response(&mut writer, request_id, None, Some(ModuleError { code: "LEXICAL_ERROR".to_string(), message: msg, input_position: Some(pos) }), start.elapsed().as_millis() as u64).await;
+                        send_response(&mut writer, request_id, None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: msg, input_position: Some(pos) }), start.elapsed().as_millis() as u64).await;
                     }
                 }
             }
