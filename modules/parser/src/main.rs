@@ -70,8 +70,10 @@ pub enum Token {
     RBrace,
     Comma,
     Exclamation,
+    Factorial,
     Question,
     Colon,
+    Dot,
     DotDot,
     LShift,
     RShift,
@@ -96,9 +98,17 @@ pub enum Token {
     Assign,
     Semicolon,
     Sum,
+    Integral,
+    Differential(String),
     Sin,
     Cos,
     Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
     Log,
     Log10,
     Log2,
@@ -133,6 +143,13 @@ pub enum Expr {
         args: Vec<Expr>,
     },
     Sequence(Vec<Expr>),
+    Log {
+        expr: Box<Expr>,
+        base: Option<Box<Expr>>,
+    },
+    Sqrt {
+        expr: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +188,8 @@ pub enum UnaryOp {
     Fact,
     Percent,
     Not,
+    Sqrt,
+    Log,
 }
 
 const MAX_RECURSION_DEPTH: usize = 256;
@@ -228,13 +247,48 @@ impl Parser {
         t
     }
 
+    fn is_function_like(&self, t: &Token) -> bool {
+        matches!(t,
+            Token::Function(_) | Token::Sin | Token::Cos | Token::Tan |
+            Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt |
+            Token::Cbrt | Token::Sum | Token::Asin | Token::Acos | Token::Atan | Token::Sinh | Token::Cosh | Token::Tanh
+        )
+    }
+
+    fn token_to_function_name(&self, t: &Token) -> String {
+        match t {
+            Token::Function(s) => s.clone(),
+            Token::Sin => "sin".to_string(),
+            Token::Cos => "cos".to_string(),
+            Token::Tan => "tan".to_string(),
+            Token::Log => "log".to_string(),
+            Token::Log10 => "log10".to_string(),
+            Token::Log2 => "log2".to_string(),
+            Token::Ln => "ln".to_string(),
+            Token::Exp => "exp".to_string(),
+            Token::Abs => "abs".to_string(),
+            Token::Sqrt => "sqrt".to_string(),
+            Token::Cbrt => "cbrt".to_string(),
+            Token::Sum => "sum".to_string(),
+            Token::Asin => "asin".to_string(),
+            Token::Acos => "acos".to_string(),
+            Token::Atan => "atan".to_string(),
+            Token::Sinh => "sinh".to_string(),
+            Token::Cosh => "cosh".to_string(),
+            Token::Tanh => "tanh".to_string(),
+            _ => format!("{:?}", t).to_lowercase(),
+        }
+    }
+
     fn can_start_primary(&self, t: &Token) -> bool {
         matches!(t,
             Token::Number(_) | Token::Pi | Token::E | Token::Infinity | Token::NaN |
             Token::LParen | Token::LBracket | Token::LBrace |
             Token::Function(_) | Token::Sin | Token::Cos | Token::Tan |
             Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt |
-            Token::Cbrt | Token::Sum | Token::String(_) | Token::I | Token::J | Token::Imaginary(_)
+            Token::Cbrt | Token::Sum | Token::String(_) | Token::I | Token::J | Token::Imaginary(_) |
+            Token::Integral | Token::Differential(_) | Token::Asin | Token::Acos | Token::Atan |
+            Token::Sinh | Token::Cosh | Token::Tanh
         )
     }
 
@@ -559,7 +613,7 @@ impl Parser {
         let mut node = self.parse_primary()?;
         while let Some(t) = self.peek() {
             let op = match t {
-                Token::Exclamation => Some(UnaryOp::Fact),
+                Token::Exclamation | Token::Factorial => Some(UnaryOp::Fact),
                 Token::Percent => {
                     let is_binary = if let Some(next_t) = self.peek_next() {
                         self.can_start_expr(next_t)
@@ -586,6 +640,7 @@ impl Parser {
     fn parse_primary(&self) -> std::result::Result<Expr, String> {
         let _guard = self.check_depth()?;
         let t = self.next().ok_or("Unexpected end of tokens")?;
+        
         match &t {
             Token::Number(n) => Ok(Expr::Number(*n)),
             Token::Pi => Ok(Expr::Number(std::f64::consts::PI)),
@@ -599,6 +654,7 @@ impl Parser {
                 lhs: Box::new(Expr::Number(*n)),
                 rhs: Box::new(Expr::Variable("i".to_string())),
             }),
+            Token::String(s) => Ok(Expr::Variable(s.clone())),
             Token::LParen | Token::LBracket | Token::LBrace => {
                 let closing = match t {
                     Token::LParen => Token::RParen,
@@ -607,72 +663,77 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let node = self.parse_expression()?;
-                let next_t = self.next();
-                if next_t != Some(closing.clone()) {
-                    return Err(format!("Expected {:?}, found {:?}", closing, next_t));
+                if self.next() != Some(closing.clone()) {
+                    return Err(format!("Expected {:?}", closing));
                 }
                 Ok(node)
             }
-            Token::Function(name) => {
-                let name = name.clone();
-                match name.to_lowercase().as_str() {
-                    "pi" => return Ok(Expr::Number(std::f64::consts::PI)),
-                    "e" => return Ok(Expr::Number(std::f64::consts::E)),
-                    "inf" | "infinity" => return Ok(Expr::Number(f64::INFINITY)),
-                    "nan" => return Ok(Expr::Number(f64::NAN)),
-                    "i" | "j" => return Ok(Expr::Variable(name.to_lowercase())),
-                    _ => {}
-                }
+            _ if self.is_function_like(&t) => {
+                let name = self.token_to_function_name(&t);
                 if matches!(self.peek(), Some(Token::LParen)) {
                     self.parse_function_call(name)
                 } else {
-                    Ok(Expr::Variable(name))
+                    // Check if it's a known constant/keyword first
+                    match name.to_lowercase().as_str() {
+                        "pi" | "π" => Ok(Expr::Number(std::f64::consts::PI)),
+                        "e" => Ok(Expr::Number(std::f64::consts::E)),
+                        "inf" | "infinity" | "∞" => Ok(Expr::Number(f64::INFINITY)),
+                        "nan" => Ok(Expr::Number(f64::NAN)),
+                        "i" | "j" => Ok(Expr::Variable(name.to_lowercase())),
+                        _ => Ok(Expr::Variable(name)),
+                    }
                 }
             }
-            Token::Sin | Token::Cos | Token::Tan | Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt | Token::Cbrt | Token::Sum => {
-                let name = match t {
-                    Token::Sin => "sin",
-                    Token::Cos => "cos",
-                    Token::Tan => "tan",
-                    Token::Log => "log",
-                    Token::Log10 => "log10",
-                    Token::Log2 => "log2",
-                    Token::Ln => "ln",
-                    Token::Exp => "exp",
-                    Token::Abs => "abs",
-                    Token::Sqrt => "sqrt",
-                    Token::Cbrt => "cbrt",
-                    Token::Sum => "sum",
-                    _ => unreachable!(),
-                }.to_string();
-                if matches!(self.peek(), Some(Token::LParen)) {
-                    self.parse_function_call(name)
-                } else {
-                    Ok(Expr::Variable(name))
-                }
-            }
-            Token::String(s) => Ok(Expr::Variable(format!("\"{}\"", s))),
             _ => Err(format!("Unexpected token in primary: {:?}", t)),
         }
     }
 
     fn parse_function_call(&self, name: String) -> std::result::Result<Expr, String> {
-        if matches!(self.peek(), Some(Token::LParen)) {
-            self.next();
-            let mut args = Vec::new();
-            if !matches!(self.peek(), Some(Token::RParen)) {
+        self.next(); // consume '('
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            args.push(self.parse_assign()?);
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.next();
                 args.push(self.parse_assign()?);
-                while matches!(self.peek(), Some(Token::Comma)) {
-                    self.next();
-                    args.push(self.parse_assign()?);
+            }
+        }
+        if self.next() != Some(Token::RParen) {
+            return Err("Expected ')' after function arguments".to_string());
+        }
+        
+        // Automatic translation as requested in markdown
+        match name.to_lowercase().as_str() {
+            "log10" => {
+                if args.len() != 1 { return Err("log10 requires exactly 1 argument".to_string()); }
+                Ok(Expr::Log {
+                    expr: Box::new(args.remove(0)),
+                    base: Some(Box::new(Expr::Number(10.0))),
+                })
+            }
+            "log2" => {
+                if args.len() != 1 { return Err("log2 requires exactly 1 argument".to_string()); }
+                Ok(Expr::Log {
+                    expr: Box::new(args.remove(0)),
+                    base: Some(Box::new(Expr::Number(2.0))),
+                })
+            }
+            "log" | "ln" => {
+                if args.len() == 1 {
+                    Ok(Expr::Log { expr: Box::new(args.remove(0)), base: None })
+                } else if args.len() == 2 {
+                    let expr = args.remove(0);
+                    let base = args.remove(0);
+                    Ok(Expr::Log { expr: Box::new(expr), base: Some(Box::new(base)) })
+                } else {
+                    Err("log requires 1 or 2 arguments".to_string())
                 }
             }
-            if !matches!(self.next(), Some(Token::RParen)) {
-                return Err("Expected ')' after function arguments".to_string());
+            "sqrt" => {
+                if args.len() != 1 { return Err("sqrt requires exactly 1 argument".to_string()); }
+                Ok(Expr::Sqrt { expr: Box::new(args.remove(0)) })
             }
-            Ok(Expr::FunctionCall { name, args })
-        } else {
-            Ok(Expr::Variable(name))
+            _ => Ok(Expr::FunctionCall { name, args }),
         }
     }
 }

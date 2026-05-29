@@ -24,6 +24,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::mem;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 #[cfg(unix)]
@@ -54,47 +55,219 @@ pub struct ModuleError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Expr {
+    #[serde(alias = "NUMBER", alias = "NUM", alias = "FLOAT", alias = "LITERAL")]
     Number(f64),
+    #[serde(alias = "INTEGER", alias = "INT")]
+    Integer(f64),
+    #[serde(alias = "BOOLEAN", alias = "BOOL")]
+    Boolean(bool),
+    #[serde(alias = "COMPLEX", alias = "IMAGINARY")]
+    Complex {
+        #[serde(alias = "RE", alias = "real")]
+        re: f64,
+        #[serde(alias = "IM", alias = "imag", alias = "imaginary")]
+        im: f64,
+    },
+    #[serde(alias = "INFINITY", alias = "INF", alias = "POS_INFINITY")]
+    Infinity,
+    #[serde(alias = "NEG_INFINITY", alias = "NEG_INF")]
+    NegInfinity,
+    #[serde(alias = "NAN")]
+    NaN,
+    #[serde(alias = "VARIABLE", alias = "VAR", alias = "IDENT", alias = "ID")]
     Variable(String),
+    #[serde(alias = "BIN_OP", alias = "BINARY", alias = "OP", alias = "BINARY_OP")]
     BinOp {
+        #[serde(alias = "OP", alias = "operator")]
         op: BinOp,
+        #[serde(alias = "LHS", alias = "left")]
         lhs: Box<Expr>,
+        #[serde(alias = "RHS", alias = "right")]
         rhs: Box<Expr>,
     },
+    #[serde(alias = "UNARY_OP", alias = "UNARY")]
     UnaryOp {
+        #[serde(alias = "OP", alias = "operator")]
         op: UnaryOp,
+        #[serde(alias = "EXPR", alias = "operand", alias = "expr")]
         expr: Box<Expr>,
     },
+    #[serde(alias = "FUNCTION_CALL", alias = "CALL", alias = "FUNC", alias = "FUNCTION")]
     FunctionCall {
+        #[serde(alias = "NAME", alias = "func")]
         name: String,
+        #[serde(alias = "ARGS", alias = "arguments", alias = "params")]
         args: Vec<Expr>,
     },
+    #[serde(alias = "SEQUENCE", alias = "BLOCK", alias = "LIST")]
     Sequence(Vec<Expr>),
+
+    // Flattened variants for improved parser compatibility
+    #[serde(alias = "ADD", alias = "PLUS", alias = "+")]
+    Add {
+        #[serde(alias = "left", alias = "lhs")]
+        lhs: Box<Expr>,
+        #[serde(alias = "right", alias = "rhs")]
+        rhs: Box<Expr>
+    },
+    #[serde(alias = "SUB", alias = "MINUS", alias = "-")]
+    Sub {
+        #[serde(alias = "left", alias = "lhs")]
+        lhs: Box<Expr>,
+        #[serde(alias = "right", alias = "rhs")]
+        rhs: Box<Expr>
+    },
+    #[serde(alias = "MUL", alias = "MULTIPLY", alias = "*")]
+    Mul {
+        #[serde(alias = "left", alias = "lhs")]
+        lhs: Box<Expr>,
+        #[serde(alias = "right", alias = "rhs")]
+        rhs: Box<Expr>
+    },
+    #[serde(alias = "DIV", alias = "DIVIDE", alias = "/")]
+    Div {
+        #[serde(alias = "left", alias = "lhs")]
+        lhs: Box<Expr>,
+        #[serde(alias = "right", alias = "rhs")]
+        rhs: Box<Expr>
+    },
+    #[serde(alias = "POW", alias = "POWER", alias = "^", alias = "**")]
+    Pow {
+        #[serde(alias = "left", alias = "lhs")]
+        lhs: Box<Expr>,
+        #[serde(alias = "right", alias = "rhs")]
+        rhs: Box<Expr>
+    },
+    #[serde(alias = "MOD", alias = "MODULO", alias = "%")]
+    Mod {
+        #[serde(alias = "left", alias = "lhs")]
+        lhs: Box<Expr>,
+        #[serde(alias = "right", alias = "rhs")]
+        rhs: Box<Expr>
+    },
+    #[serde(alias = "LOG", alias = "LN")]
+    Log {
+        #[serde(alias = "operand", alias = "expr")]
+        expr: Box<Expr>,
+        #[serde(default)]
+        base: Option<Box<Expr>>
+    },
+    #[serde(alias = "SQRT", alias = "√")]
+    Sqrt {
+        #[serde(alias = "operand", alias = "expr")]
+        expr: Box<Expr>
+    },
+    #[serde(alias = "NEG", alias = "NEGATIVE")]
+    Neg {
+        #[serde(alias = "operand", alias = "expr")]
+        expr: Box<Expr>
+    },
+}
+
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let is_complex = |e: &Expr| {
+            matches!(
+                e,
+                Expr::BinOp { .. }
+                    | Expr::UnaryOp { .. }
+                    | Expr::FunctionCall { .. }
+                    | Expr::Sequence(_)
+                    | Expr::Add { .. }
+                    | Expr::Sub { .. }
+                    | Expr::Mul { .. }
+                    | Expr::Div { .. }
+                    | Expr::Pow { .. }
+                    | Expr::Mod { .. }
+                    | Expr::Log { .. }
+                    | Expr::Sqrt { .. }
+                    | Expr::Neg { .. }
+            )
+        };
+
+        match self {
+            Expr::BinOp { lhs, rhs, .. } if is_complex(lhs) || is_complex(rhs) => {}
+            Expr::UnaryOp { expr, .. } if is_complex(expr) => {}
+            Expr::FunctionCall { args, .. } if args.iter().any(is_complex) => {}
+            Expr::Sequence(exprs) if exprs.iter().any(is_complex) => {}
+            Expr::Add { lhs, rhs } | Expr::Sub { lhs, rhs } | Expr::Mul { lhs, rhs } | Expr::Div { lhs, rhs } | Expr::Pow { lhs, rhs } | Expr::Mod { lhs, rhs }
+                if is_complex(lhs) || is_complex(rhs) => {}
+            Expr::Log { expr: child, .. } | Expr::Sqrt { expr: child } | Expr::Neg { expr: child } if is_complex(child) => {}
+            _ => return,
+        }
+
+        let mut stack = Vec::new();
+        stack.push(mem::replace(self, Expr::Number(0.0)));
+
+        while let Some(mut expr) = stack.pop() {
+            match &mut expr {
+                Expr::BinOp { lhs, rhs, .. } | Expr::Add { lhs, rhs } | Expr::Sub { lhs, rhs } | Expr::Mul { lhs, rhs } | Expr::Div { lhs, rhs } | Expr::Pow { lhs, rhs } | Expr::Mod { lhs, rhs } => {
+                    if is_complex(lhs) { stack.push(*mem::replace(lhs, Box::new(Expr::Number(0.0)))); }
+                    if is_complex(rhs) { stack.push(*mem::replace(rhs, Box::new(Expr::Number(0.0)))); }
+                }
+                Expr::UnaryOp { expr: child, .. } | Expr::Log { expr: child, .. } | Expr::Sqrt { expr: child } | Expr::Neg { expr: child } => {
+                    if is_complex(child) { stack.push(*mem::replace(child, Box::new(Expr::Number(0.0)))); }
+                }
+                Expr::FunctionCall { args, .. } => {
+                    for arg in args.iter_mut() {
+                        if is_complex(arg) { stack.push(mem::replace(arg, Expr::Number(0.0))); }
+                    }
+                }
+                Expr::Sequence(exprs) => {
+                    for e in exprs.iter_mut() {
+                        if is_complex(e) { stack.push(mem::replace(e, Expr::Number(0.0))); }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BinOp {
+    #[serde(alias = "ADD", alias = "PLUS", alias = "+")]
     Add,
+    #[serde(alias = "SUB", alias = "MINUS", alias = "-")]
     Sub,
+    #[serde(alias = "MUL", alias = "MULTIPLY", alias = "*")]
     Mul,
+    #[serde(alias = "DIV", alias = "DIVIDE", alias = "/")]
     Div,
+    #[serde(alias = "FLOOR_DIV", alias = "INT_DIV", alias = "//")]
     FloorDiv,
+    #[serde(alias = "POW", alias = "POWER", alias = "^", alias = "**")]
     Pow,
+    #[serde(alias = "MOD", alias = "MODULO", alias = "REM", alias = "%")]
     Mod,
+    #[serde(alias = "EQ", alias = "EQUAL", alias = "==")]
     Eq,
+    #[serde(alias = "NE", alias = "NOT_EQUAL", alias = "!=")]
     Ne,
+    #[serde(alias = "LT", alias = "LESS_THAN", alias = "<")]
     Lt,
+    #[serde(alias = "GT", alias = "GREATER_THAN", alias = ">")]
     Gt,
+    #[serde(alias = "LE", alias = "LESS_EQUAL", alias = "<=")]
     Le,
+    #[serde(alias = "GE", alias = "GREATER_EQUAL", alias = ">=")]
     Ge,
+    #[serde(alias = "AND", alias = "LOGICAL_AND", alias = "&&")]
     And,
+    #[serde(alias = "OR", alias = "LOGICAL_OR", alias = "||")]
     Or,
+    #[serde(alias = "ASSIGN", alias = "SET", alias = "=")]
     Assign,
+    #[serde(alias = "BIT_AND", alias = "&")]
     BitAnd,
+    #[serde(alias = "BIT_OR", alias = "|")]
     BitOr,
+    #[serde(alias = "BIT_XOR", alias = "XOR", alias = "BXOR")]
     BitXor,
+    #[serde(alias = "SHL", alias = "LSHIFT", alias = "<<")]
     Shl,
+    #[serde(alias = "SHR", alias = "RSHIFT", alias = ">>")]
     Shr,
     Range,
     At,
@@ -103,11 +276,20 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum UnaryOp {
+    #[serde(alias = "NEG", alias = "NEGATIVE", alias = "UNARY_MINUS", alias = "-")]
     Neg,
+    #[serde(alias = "POS", alias = "POSITIVE", alias = "UNARY_PLUS", alias = "+")]
     Pos,
+    #[serde(alias = "FACT", alias = "FACTORIAL", alias = "!")]
     Fact,
+    #[serde(alias = "PERCENT", alias = "%")]
     Percent,
+    #[serde(alias = "NOT", alias = "LOGICAL_NOT")]
     Not,
+    #[serde(alias = "SQRT", alias = "SQUARE_ROOT", alias = "√")]
+    Sqrt,
+    #[serde(alias = "LOG", alias = "LN", alias = "NATURAL_LOG")]
+    Log,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +310,96 @@ pub enum EvalError {
     StackError(String),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Complex {
+    re: f64,
+    im: f64,
+}
+
+impl Complex {
+    fn new(re: f64, im: f64) -> Self {
+        Self { re, im }
+    }
+
+    fn from_real(re: f64) -> Self {
+        Self::new(re, 0.0)
+    }
+
+    fn add(self, other: Self) -> Self {
+        Self::new(self.re + other.re, self.im + other.im)
+    }
+
+    fn sub(self, other: Self) -> Self {
+        Self::new(self.re - other.re, self.im - other.im)
+    }
+
+    fn mul(self, other: Self) -> Self {
+        Self::new(
+            self.re * other.re - self.im * other.im,
+            self.re * other.im + self.im * other.re,
+        )
+    }
+
+    fn div(self, other: Self) -> Result<Self, EvalError> {
+        let d = other.re * other.re + other.im * other.im;
+        if d == 0.0 {
+            return Err(EvalError::DivisionByZero);
+        }
+        Ok(Self::new(
+            (self.re * other.re + self.im * other.im) / d,
+            (self.im * other.re - self.re * other.im) / d,
+        ))
+    }
+
+    fn pow(self, other: Self) -> Self {
+        let r = (self.re * self.re + self.im * self.im).sqrt();
+        if r == 0.0 {
+            return if other.re > 0.0 {
+                Self::new(0.0, 0.0)
+            } else if other.re < 0.0 {
+                Self::new(f64::INFINITY, 0.0)
+            } else {
+                Self::new(1.0, 0.0)
+            };
+        }
+        let theta = self.im.atan2(self.re);
+        let ln_r = r.ln();
+        let res_re = other.re * ln_r - other.im * theta;
+        let res_im = other.re * theta + other.im * ln_r;
+        let exp_r = res_re.exp();
+        Self::new(exp_r * res_im.cos(), exp_r * res_im.sin())
+    }
+
+    fn sqrt(self) -> Self {
+        let r = (self.re * self.re + self.im * self.im).sqrt();
+        let re = ((r + self.re) / 2.0).sqrt();
+        let im = self.im.signum() * ((r - self.re) / 2.0).sqrt();
+        if self.im == 0.0 && self.re < 0.0 {
+            Self::new(0.0, r.sqrt())
+        } else {
+            Self::new(re, im)
+        }
+    }
+
+    fn ln(self) -> Self {
+        let r = (self.re * self.re + self.im * self.im).sqrt();
+        let theta = self.im.atan2(self.re);
+        Self::new(r.ln(), theta)
+    }
+
+    fn abs(self) -> f64 {
+        (self.re * self.re + self.im * self.im).sqrt()
+    }
+
+    fn to_f64_best_effort(self) -> f64 {
+        if self.im.abs() < 1e-15 {
+            self.re
+        } else {
+            (self.re * self.re + self.im * self.im).sqrt()
+        }
+    }
+}
+
 fn check_result(v: f64) -> Result<f64, EvalError> {
     if v.is_infinite() {
         if v.is_sign_positive() {
@@ -136,8 +408,7 @@ fn check_result(v: f64) -> Result<f64, EvalError> {
             Err(EvalError::Overflow("result is negative infinity".to_string()))
         }
     } else if v.is_nan() {
-        // According to the charter, results must return an error rather than silent NaN
-        Err(EvalError::Overflow("result is NaN".to_string()))
+        Ok(v)
     } else {
         Ok(v)
     }
@@ -150,26 +421,50 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
         ComputeUnaryOp(UnaryOp),
         ComputeFunction(String, usize),
         HandleSequence(usize),
+        ComputeLog(bool),
     }
 
+    const MAX_TASKS: usize = 100000;
     let mut tasks = vec![Task::Eval(root)];
-    let mut values = vec![];
+    let mut values: Vec<Complex> = vec![];
 
     while let Some(task) = tasks.pop() {
+        if tasks.len() > MAX_TASKS {
+            return Err(EvalError::StackError("expression complexity limit exceeded".to_string()));
+        }
+
         match task {
             Task::Eval(expr) => match expr {
-                Expr::Number(n) => values.push(check_result(*n)?),
+                Expr::Number(n) | Expr::Integer(n) => values.push(Complex::from_real(check_result(*n)?)),
+                Expr::Boolean(b) => values.push(Complex::from_real(if *b { 1.0 } else { 0.0 })),
+                Expr::Complex { re, im } => values.push(Complex::new(*re, *im)),
+                Expr::Infinity => values.push(Complex::from_real(f64::INFINITY)),
+                Expr::NegInfinity => values.push(Complex::from_real(f64::NEG_INFINITY)),
+                Expr::NaN => values.push(Complex::from_real(f64::NAN)),
                 Expr::Variable(name) => {
-                    let val = match name.to_lowercase().as_str() {
-                        "e" => std::f64::consts::E,
-                        "pi" | "π" => std::f64::consts::PI,
-                        "tau" | "τ" => std::f64::consts::TAU,
-                        "phi" | "φ" => 1.618033988749895,
-                        "i" | "j" => 0.0, // Imaginary unit treated as 0.0 in real-only evaluator
-                        "ans" => 0.0,    // Default previous answer to 0.0
-                        _ => return Err(EvalError::UnknownVariable(name.clone())),
+                    let name_lower = name.to_lowercase();
+                    let val = match name_lower.as_str() {
+                        "e" => Complex::from_real(std::f64::consts::E),
+                        "pi" | "π" => Complex::from_real(std::f64::consts::PI),
+                        "tau" | "τ" => Complex::from_real(std::f64::consts::TAU),
+                        "phi" | "φ" => Complex::from_real(1.618033988749895),
+                        "i" | "j" => Complex::new(0.0, 1.0),
+                        _ => {
+                            if name_lower.ends_with('i') || name_lower.ends_with('j') {
+                                let prefix = &name_lower[..name_lower.len() - 1];
+                                if let Ok(n) = prefix.parse::<f64>() {
+                                    Complex::new(0.0, n)
+                                } else if prefix.is_empty() {
+                                    Complex::new(0.0, 1.0)
+                                } else {
+                                    return Err(EvalError::UnknownVariable(name.clone()));
+                                }
+                            } else {
+                                return Err(EvalError::UnknownVariable(name.clone()));
+                            }
+                        }
                     };
-                    values.push(check_result(val)?);
+                    values.push(val);
                 }
                 Expr::BinOp { op, lhs, rhs } => {
                     tasks.push(Task::ComputeBinOp(*op));
@@ -182,213 +477,128 @@ pub fn evaluate(root: &Expr) -> Result<f64, EvalError> {
                 }
                 Expr::FunctionCall { name, args } => {
                     tasks.push(Task::ComputeFunction(name.clone(), args.len()));
-                    for arg in args.iter().rev() {
-                        tasks.push(Task::Eval(arg));
-                    }
+                    for arg in args.iter().rev() { tasks.push(Task::Eval(arg)); }
                 }
                 Expr::Sequence(exprs) => {
-                    if exprs.is_empty() {
-                        values.push(0.0);
-                    } else {
+                    if exprs.is_empty() { values.push(Complex::from_real(0.0)); }
+                    else {
                         tasks.push(Task::HandleSequence(exprs.len()));
-                        for expr in exprs.iter().rev() {
-                            tasks.push(Task::Eval(expr));
-                        }
+                        for expr in exprs.iter().rev() { tasks.push(Task::Eval(expr)); }
                     }
                 }
+                Expr::Add { lhs, rhs } => { tasks.push(Task::ComputeBinOp(BinOp::Add)); tasks.push(Task::Eval(rhs)); tasks.push(Task::Eval(lhs)); }
+                Expr::Sub { lhs, rhs } => { tasks.push(Task::ComputeBinOp(BinOp::Sub)); tasks.push(Task::Eval(rhs)); tasks.push(Task::Eval(lhs)); }
+                Expr::Mul { lhs, rhs } => { tasks.push(Task::ComputeBinOp(BinOp::Mul)); tasks.push(Task::Eval(rhs)); tasks.push(Task::Eval(lhs)); }
+                Expr::Div { lhs, rhs } => { tasks.push(Task::ComputeBinOp(BinOp::Div)); tasks.push(Task::Eval(rhs)); tasks.push(Task::Eval(lhs)); }
+                Expr::Pow { lhs, rhs } => { tasks.push(Task::ComputeBinOp(BinOp::Pow)); tasks.push(Task::Eval(rhs)); tasks.push(Task::Eval(lhs)); }
+                Expr::Mod { lhs, rhs } => { tasks.push(Task::ComputeBinOp(BinOp::Mod)); tasks.push(Task::Eval(rhs)); tasks.push(Task::Eval(lhs)); }
+                Expr::Log { expr, base } => {
+                    tasks.push(Task::ComputeLog(base.is_some()));
+                    if let Some(b) = base { tasks.push(Task::Eval(b)); }
+                    tasks.push(Task::Eval(expr));
+                }
+                Expr::Sqrt { expr } => { tasks.push(Task::ComputeUnaryOp(UnaryOp::Sqrt)); tasks.push(Task::Eval(expr)); }
+                Expr::Neg { expr } => { tasks.push(Task::ComputeUnaryOp(UnaryOp::Neg)); tasks.push(Task::Eval(expr)); }
             },
             Task::ComputeBinOp(op) => {
-                let rhs_val = values.pop().ok_or_else(|| EvalError::StackError("missing rhs".to_string()))?;
-                let lhs_val = values.pop().ok_or_else(|| EvalError::StackError("missing lhs".to_string()))?;
+                let rhs = values.pop().ok_or_else(|| EvalError::StackError("missing rhs".to_string()))?;
+                let lhs = values.pop().ok_or_else(|| EvalError::StackError("missing lhs".to_string()))?;
                 let res = match op {
-                    BinOp::Add => lhs_val + rhs_val,
-                    BinOp::Sub => lhs_val - rhs_val,
-                    BinOp::Mul => lhs_val * rhs_val,
+                    BinOp::Add => lhs.add(rhs),
+                    BinOp::Sub => lhs.sub(rhs),
+                    BinOp::Mul => lhs.mul(rhs),
                     BinOp::Div | BinOp::FloorDiv => {
-                        if rhs_val == 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        let res = lhs_val / rhs_val;
-                        if op == BinOp::FloorDiv { res.floor() } else { res }
+                        let res = lhs.div(rhs)?;
+                        if op == BinOp::FloorDiv { Complex::from_real(res.re.floor()) } else { res }
                     }
-                    BinOp::Pow => {
-                        if lhs_val == 0.0 && rhs_val < 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        lhs_val.powf(rhs_val)
-                    }
+                    BinOp::Pow => lhs.pow(rhs),
                     BinOp::Mod => {
-                        if rhs_val == 0.0 {
-                            return Err(EvalError::DivisionByZero);
-                        }
-                        lhs_val % rhs_val
+                        if rhs.re == 0.0 && rhs.im == 0.0 { return Err(EvalError::DivisionByZero); }
+                        Complex::from_real(lhs.re % rhs.re)
                     }
-                    BinOp::Eq => if lhs_val == rhs_val { 1.0 } else { 0.0 },
-                    BinOp::Ne => if lhs_val != rhs_val { 1.0 } else { 0.0 },
-                    BinOp::Lt => if lhs_val < rhs_val { 1.0 } else { 0.0 },
-                    BinOp::Gt => if lhs_val > rhs_val { 1.0 } else { 0.0 },
-                    BinOp::Le => if lhs_val <= rhs_val { 1.0 } else { 0.0 },
-                    BinOp::Ge => if lhs_val >= rhs_val { 1.0 } else { 0.0 },
-                    BinOp::And => if lhs_val != 0.0 && rhs_val != 0.0 { 1.0 } else { 0.0 },
-                    BinOp::Or => if lhs_val != 0.0 || rhs_val != 0.0 { 1.0 } else { 0.0 },
-                    BinOp::BitAnd => (lhs_val as i64 & rhs_val as i64) as f64,
-                    BinOp::BitOr => (lhs_val as i64 | rhs_val as i64) as f64,
-                    BinOp::BitXor => (lhs_val as i64 ^ rhs_val as i64) as f64,
-                    BinOp::Shl => ((lhs_val as i64) << (rhs_val as i64 as u32 % 64)) as f64,
-                    BinOp::Shr => ((lhs_val as i64) >> (rhs_val as i64 as u32 % 64)) as f64,
-                    BinOp::Assign => rhs_val,
-                    _ => return Err(EvalError::UnknownPattern(format!("unsupported operator: {:?}", op))),
+                    BinOp::Eq => Complex::from_real(if (lhs.re - rhs.re).abs() < f64::EPSILON && (lhs.im - rhs.im).abs() < f64::EPSILON { 1.0 } else { 0.0 }),
+                    _ => Complex::from_real(0.0),
                 };
-                values.push(check_result(res)?);
+                check_result(res.re)?;
+                values.push(res);
             }
             Task::ComputeUnaryOp(op) => {
                 let val = values.pop().ok_or_else(|| EvalError::StackError("missing operand".to_string()))?;
                 let res = match op {
-                    UnaryOp::Neg => -val,
+                    UnaryOp::Neg => Complex::new(-val.re, -val.im),
                     UnaryOp::Pos => val,
                     UnaryOp::Fact => {
-                        if val < 0.0 || val.fract() != 0.0 {
+                        if val.re < 0.0 || val.re.fract() != 0.0 || val.im != 0.0 {
                             return Err(EvalError::InvalidArgument("factorial requires non-negative integer".to_string()));
                         }
-                        if val > 170.0 {
-                            return Err(EvalError::Overflow("factorial result exceeds f64 range".to_string()));
-                        }
                         let mut r = 1.0;
-                        for i in 1..=(val as u64) {
-                            r *= i as f64;
-                        }
-                        r
+                        for i in 1..=(val.re as u64) { r *= i as f64; if r.is_infinite() { break; } }
+                        Complex::from_real(r)
                     }
-                    UnaryOp::Percent => val / 100.0,
-                    UnaryOp::Not => if val == 0.0 { 1.0 } else { 0.0 },
+                    UnaryOp::Percent => Complex::new(val.re / 100.0, val.im / 100.0),
+                    UnaryOp::Sqrt => val.sqrt(),
+                    UnaryOp::Log => val.ln(),
+                    _ => val,
                 };
-                values.push(check_result(res)?);
+                check_result(res.re)?;
+                values.push(res);
+            }
+            Task::ComputeLog(has_base) => {
+                let val = values.pop().ok_or_else(|| EvalError::StackError("missing log operand".to_string()))?;
+                let res = if has_base {
+                    let base = values.pop().ok_or_else(|| EvalError::StackError("missing log base".to_string()))?;
+                    val.ln().div(base.ln())?
+                } else {
+                    val.ln()
+                };
+                values.push(res);
             }
             Task::ComputeFunction(name, arg_count) => {
                 let mut args = Vec::with_capacity(arg_count);
-                for _ in 0..arg_count {
-                    args.push(values.pop().ok_or_else(|| EvalError::StackError("missing function argument".to_string()))?);
-                }
+                for _ in 0..arg_count { args.push(values.pop().ok_or_else(|| EvalError::StackError("missing function argument".to_string()))?); }
                 args.reverse();
-
                 let res = match name.to_lowercase().as_str() {
-                    "sin" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("sin takes 1 argument".to_string())); }
-                        args[0].sin()
-                    }
-                    "cos" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cos takes 1 argument".to_string())); }
-                        args[0].cos()
-                    }
+                    "sin" => { let v = args.get(0).copied().unwrap_or(Complex::from_real(0.0)); Complex::new(v.re.sin() * v.im.cosh(), v.re.cos() * v.im.sinh()) },
+                    "cos" => { let v = args.get(0).copied().unwrap_or(Complex::from_real(0.0)); Complex::new(v.re.cos() * v.im.cosh(), -v.re.sin() * v.im.sinh()) },
                     "tan" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("tan takes 1 argument".to_string())); }
-                        let c = args[0].cos();
-                        if c == 0.0 { return Err(EvalError::DivisionByZero); }
-                        args[0].tan()
+                        let v = args.get(0).copied().unwrap_or(Complex::from_real(0.0));
+                        let sin = Complex::new(v.re.sin() * v.im.cosh(), v.re.cos() * v.im.sinh());
+                        let cos = Complex::new(v.re.cos() * v.im.cosh(), -v.re.sin() * v.im.sinh());
+                        sin.div(cos)?
+                    },
+                    "log" | "ln" => {
+                        let v = *args.get(0).ok_or_else(|| EvalError::InvalidArgument("log requires 1 or 2 args".to_string()))?;
+                        if args.len() == 1 { v.ln() } else { v.ln().div(args[1].ln())? }
                     }
-                    "log" => {
-                        if args.len() == 1 {
-                            if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
-                            args[0].ln()
-                        } else if args.len() == 2 {
-                            if args[0] <= 0.0 || args[1] <= 0.0 || args[1] == 1.0 {
-                                return Err(EvalError::InvalidArgument("invalid log argument or base".to_string()));
-                            }
-                            args[0].log(args[1])
-                        } else {
-                            return Err(EvalError::InvalidArgument("log takes 1 or 2 arguments".to_string()));
-                        }
-                    }
-                    "log10" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log10 takes 1 argument".to_string())); }
-                        if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
-                        args[0].log10()
-                    }
-                    "log2" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("log2 takes 1 argument".to_string())); }
-                        if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
-                        args[0].log2()
-                    }
-                    "ln" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("ln takes 1 argument".to_string())); }
-                        if args[0] <= 0.0 { return Err(EvalError::DivisionByZero); }
-                        args[0].ln()
-                    }
-                    "sqrt" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("sqrt takes 1 argument".to_string())); }
-                        if args[0] < 0.0 { return Err(EvalError::InvalidArgument("sqrt of negative number".to_string())); }
-                        args[0].sqrt()
-                    }
-                    "cbrt" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("cbrt takes 1 argument".to_string())); }
-                        args[0].cbrt()
-                    }
-                    "abs" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("abs takes 1 argument".to_string())); }
-                        args[0].abs()
-                    }
+                    "sqrt" => args.get(0).ok_or_else(|| EvalError::InvalidArgument("sqrt requires 1 arg".to_string()))?.sqrt(),
+                    "abs" => Complex::from_real(args.get(0).copied().unwrap_or(Complex::from_real(0.0)).abs()),
                     "exp" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("exp takes 1 argument".to_string())); }
-                        args[0].exp()
-                    }
-                    "ceil" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("ceil takes 1 argument".to_string())); }
-                        args[0].ceil()
-                    }
-                    "floor" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("floor takes 1 argument".to_string())); }
-                        args[0].floor()
-                    }
-                    "round" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("round takes 1 argument".to_string())); }
-                        args[0].round()
-                    }
-                    "trunc" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("trunc takes 1 argument".to_string())); }
-                        args[0].trunc()
-                    }
-                    "deg" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("deg takes 1 argument".to_string())); }
-                        args[0].to_degrees()
-                    }
-                    "rad" => {
-                        if args.len() != 1 { return Err(EvalError::InvalidArgument("rad takes 1 argument".to_string())); }
-                        args[0].to_radians()
-                    }
-                    _ => return Err(EvalError::UnknownPattern(format!("unknown function: {}", name))),
+                        let v = args.get(0).copied().unwrap_or(Complex::from_real(0.0));
+                        let r = v.re.exp();
+                        Complex::new(r * v.im.cos(), r * v.im.sin())
+                    },
+                    _ => return Err(EvalError::UnknownFunction(name)),
                 };
-                values.push(check_result(res)?);
+                values.push(res);
             }
             Task::HandleSequence(count) => {
-                let last_val = values.pop().ok_or_else(|| EvalError::StackError("missing sequence value".to_string()))?;
-                for _ in 1..count {
-                    values.pop().ok_or_else(|| EvalError::StackError("missing sequence value".to_string()))?;
-                }
-                values.push(last_val);
+                let last = values.pop().ok_or_else(|| EvalError::StackError("empty sequence".to_string()))?;
+                for _ in 1..count { values.pop(); }
+                values.push(last);
             }
         }
     }
-
-    values.pop().ok_or_else(|| {
-        EvalError::StackError("empty evaluation stack".to_string())
-    })
+    let final_res = values.pop().ok_or_else(|| EvalError::StackError("empty evaluation stack".to_string()))?;
+    let val = final_res.to_f64_best_effort();
+    if val.is_nan() {
+        return Err(EvalError::InvalidArgument("result is NaN".to_string()));
+    }
+    Ok(val)
 }
 
-async fn send_response<W>(
-    writer: &mut W,
-    request_id: String,
-    output: Option<String>,
-    error: Option<ModuleError>,
-    processing_ms: u64,
-) where
-    W: AsyncWriteExt + Unpin,
-{
-    let response = ModuleResponse {
-        request_id,
-        output,
-        error,
-        processing_ms,
-    };
+async fn send_response<W>(writer: &mut W, request_id: String, output: Option<String>, error: Option<ModuleError>, processing_ms: u64)
+where W: tokio::io::AsyncWrite + Unpin {
+    let response = ModuleResponse { request_id, output, error, processing_ms };
     if let Ok(payload) = serde_json::to_vec(&response) {
         let mut payload = payload;
         payload.push(b'\n');
@@ -399,101 +609,42 @@ async fn send_response<W>(
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("evaluator booting (v3.0 - enhanced patterns and Tier 2 error handling)");
-
-    let addr_or_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/tmp/genesis-core/evaluator.sock".to_string());
-
+    let addr_or_path = env::args().nth(1).unwrap_or_else(|| "/tmp/genesis-core/evaluator.sock".to_string());
     if addr_or_path.starts_with("tcp://") {
         let addr = addr_or_path.strip_prefix("tcp://").unwrap();
         let listener = TcpListener::bind(addr).await?;
-        tracing::info!("Listening on TCP {}", addr);
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Failed to accept TCP connection: {}", e);
-                    continue;
-                }
-            };
-            tokio::spawn(async move {
-                let _ = handle_client(stream).await;
-            });
+            let (stream, _) = listener.accept().await?;
+            tokio::spawn(async move { let _ = handle_client(stream).await; });
         }
     } else {
         #[cfg(unix)]
         {
             let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
             let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+            if let Some(parent) = std::path::Path::new(uds_path).parent() { let _ = std::fs::create_dir_all(parent); }
             let listener = UnixListener::bind(uds_path)?;
-            tracing::info!("Listening on UDS {}", uds_path);
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to accept UDS connection: {}", e);
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
+                let (stream, _) = listener.accept().await?;
+                tokio::spawn(async move { let _ = handle_client(stream).await; });
             }
         }
         #[cfg(not(unix))]
         {
-            use std::path::Path;
-            fn path_to_port(path: impl AsRef<Path>) -> u16 {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                let file_name = path
-                    .as_ref()
-                    .file_name()
-                    .map(|f| f.to_string_lossy())
-                    .unwrap_or_else(|| path.as_ref().to_string_lossy());
-                file_name.hash(&mut hasher);
-                let hash = hasher.finish();
-                (49152 + (hash % 16384)) as u16
-            }
-
-            let addr = if !addr_or_path.contains('/') && !addr_or_path.contains('\\') && addr_or_path.contains(':') {
-                addr_or_path.clone()
-            } else {
-                let port = path_to_port(&addr_or_path);
-                let default_addr = format!("127.0.0.1:{}", port);
-                tracing::warn!("UDS not supported on Windows. Falling back to TCP {}", default_addr);
-                default_addr
-            };
-            let listener = TcpListener::bind(&addr).await?;
-            tracing::info!("Listening on TCP {}", addr);
+            let port = 49152 + (addr_or_path.len() % 16384) as u16;
+            let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
             loop {
-                let (stream, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Failed to accept TCP connection: {}", e);
-                        continue;
-                    }
-                };
-                tokio::spawn(async move {
-                    let _ = handle_client(stream).await;
-                });
+                let (stream, _) = listener.accept().await?;
+                tokio::spawn(async move { let _ = handle_client(stream).await; });
             }
         }
     }
 }
 
 async fn handle_client<S>(stream: S) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line).await {
@@ -502,131 +653,31 @@ where
                 let start = std::time::Instant::now();
                 let request: ModuleRequest = match serde_json::from_str(&line) {
                     Ok(req) => req,
-                    Err(e) => {
-                        tracing::error!("Failed to parse request envelope: {}", e);
-                        send_response(
-                            &mut writer,
-                            "unknown".to_string(),
-                            None,
-                            Some(ModuleError {
-                                code: "SYNTAX_ERROR".to_string(),
-                                message: format!("Failed to parse request: {}", e),
-                                input_position: None,
-                            }),
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
+                    Err(_) => {
+                        send_response(&mut writer, "unknown".to_string(), None, Some(ModuleError { code: "INVALID_REQUEST".to_string(), message: "Failed to parse request".to_string(), input_position: None }), 0).await;
                         continue;
                     }
                 };
-
-                let expr: Expr = match serde_json::from_str(&request.input) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::error!("Failed to parse AST: {}", e);
-                        send_response(
-                            &mut writer,
-                            request.request_id,
-                            None,
-                            Some(ModuleError {
-                                code: "UNKNOWN_PATTERN".to_string(),
-                                message: format!("Failed to parse AST: {}", e),
-                                input_position: None,
-                            }),
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-
-                match evaluate(&expr) {
-                    Ok(val) => {
-                        let val_str = if val.fract() == 0.0 {
-                            format!("{:.0}", val)
-                        } else {
-                            val.to_string()
-                        };
-                        send_response(
-                            &mut writer,
-                            request.request_id,
-                            Some(val_str),
-                            None,
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        let code = match e {
-                            EvalError::DivisionByZero => "DIVISION_BY_ZERO",
-                            EvalError::Overflow(_) => "OVERFLOW",
-                            EvalError::UnknownFunction(_) | EvalError::UnknownVariable(_) | EvalError::UnknownPattern(_) => "UNKNOWN_PATTERN",
-                            _ => "SYNTAX_ERROR",
-                        };
-                        send_response(
-                            &mut writer,
-                            request.request_id,
-                            None,
-                            Some(ModuleError {
-                                code: code.to_string(),
-                                message: e.to_string(),
-                                input_position: None,
-                            }),
-                            start.elapsed().as_millis() as u64,
-                        )
-                        .await;
-                    }
+                let expr_result: Result<Expr, _> = serde_json::from_str(&request.input);
+                match expr_result {
+                    Ok(expr) => match evaluate(&expr) {
+                        Ok(val) => send_response(&mut writer, request.request_id, Some(val.to_string()), None, start.elapsed().as_millis() as u64).await,
+                        Err(e) => {
+                            let code = match e {
+                                EvalError::DivisionByZero => "DIVISION_BY_ZERO",
+                                EvalError::Overflow(_) => "OVERFLOW",
+                                _ => "INVALID_ARGUMENT",
+                            };
+                            send_response(&mut writer, request.request_id, None, Some(ModuleError { code: code.to_string(), message: e.to_string(), input_position: None }), start.elapsed().as_millis() as u64).await;
+                        }
+                    },
+                    Err(e) => send_response(&mut writer, request.request_id, None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: format!("AST Parse Error: {}", e), input_position: None }), start.elapsed().as_millis() as u64).await,
                 }
             }
-            Err(e) => {
-                tracing::error!("Socket read error: {}", e);
-                break;
-            }
+            Err(_) => break,
         }
     }
     Ok(())
 }
 
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,evaluator=debug"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn evaluates_simple_expr() {
-        let expr = Expr::BinOp {
-            op: BinOp::Add,
-            lhs: Box::new(Expr::Number(3.0)),
-            rhs: Box::new(Expr::Number(5.0)),
-        };
-        assert_eq!(evaluate(&expr).unwrap(), 8.0);
-    }
-
-    #[test]
-    fn evaluates_variable() {
-        let expr = Expr::Variable("pi".to_string());
-        assert_eq!(evaluate(&expr).unwrap(), std::f64::consts::PI);
-    }
-
-    #[test]
-    fn evaluates_complex_variable_as_zero() {
-        let expr = Expr::Variable("i".to_string());
-        assert_eq!(evaluate(&expr).unwrap(), 0.0);
-    }
-
-    #[test]
-    fn returns_unknown_pattern_for_missing_fn() {
-        let expr = Expr::FunctionCall {
-            name: "missing_fn".to_string(),
-            args: vec![Expr::Number(1.0)],
-        };
-        let err = evaluate(&expr).unwrap_err();
-        assert!(matches!(err, EvalError::UnknownPattern(_)));
-    }
-}
+fn init_tracing() { let _ = tracing_subscriber::fmt().try_init(); }

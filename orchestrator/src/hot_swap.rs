@@ -13,8 +13,7 @@
 use anyhow::{bail, Context, Result};
 use compat::UnixStream;
 use std::path::Path;
-use std::process::Stdio;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tracing::{info, warn};
 
 pub struct HotSwapper {
@@ -57,12 +56,8 @@ impl HotSwapper {
         }
 
         // 4. 新プロセスを起動
-        let new_child = Command::new(&self.binary_path)
-            .arg(&self.socket_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to spawn new process: {}", self.binary_path))?;
+        let new_proc = crate::process::ModuleProcess::spawn(&self.module_name, &self.binary_path, &self.socket_path).await?;
+        let new_child = new_proc.child;
 
         info!(module = %self.module_name, "hot_swap: new process spawned");
 

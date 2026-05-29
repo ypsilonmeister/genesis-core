@@ -407,19 +407,11 @@ async fn main() -> Result<()> {
                                     }
                                     Err(e) => {
                                         warn!(err = %e, "Tier 2 hot_swap failed, attempting to restart from binary");
-                                        let restarted_child = Command::new(&m_cfg.binary)
-                                            .arg(&m_cfg.socket)
-                                            .stdout(Stdio::null())
-                                            .stderr(Stdio::null())
-                                            .spawn();
+                                        let restarted_child = ModuleProcess::spawn(&m_cfg.name, &m_cfg.binary, &m_cfg.socket).await;
                                         
                                         match restarted_child {
                                             Ok(c) => {
-                                                let new_proc = ModuleProcess {
-                                                    name: m_cfg.name.clone(),
-                                                    child: c,
-                                                };
-                                                processes.insert(idx, (m_cfg, new_proc));
+                                                processes.insert(idx, (m_cfg, c));
                                             }
                                             Err(e2) => error!(err = %e2, "Failed to restart module after hot_swap failure"),
                                         }
@@ -537,22 +529,12 @@ async fn spawn_and_insert_module(
         spec.binary_path.clone()
     };
 
-    let child = Command::new(&binary_path)
-        .arg(&spec.socket_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let proc = ModuleProcess::spawn(&spec.name, &binary_path, &spec.socket_path).await?;
 
     let module_spec = ModuleSpec {
         name: spec.name.clone(),
         binary: spec.binary_path,
         socket: spec.socket_path,
-    };
-    let proc = ModuleProcess {
-        name: spec.name.clone(),
-        child,
     };
     processes.insert(insert_idx, (module_spec, proc));
     info!(name = %spec.name, idx = insert_idx, "Tier 2: new module inserted into chain");
