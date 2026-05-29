@@ -208,21 +208,14 @@ impl Default for AgyCli {
 #[async_trait]
 impl AiBackend for AgyCli {
     async fn complete(&self, prompt: &str) -> Result<String> {
-        let mut child = create_command(&self.binary)
+        let child = create_command(&self.binary)
             .arg("--dangerously-skip-permissions")
-            .stdin(std::process::Stdio::piped())
+            .arg("--print")
+            .arg(prompt)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to spawn '{}'", self.binary))?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .context("Failed to write prompt to stdin")?;
-        }
 
         let output = child
             .wait_with_output()
@@ -244,6 +237,7 @@ impl AiBackend for AgyCli {
         Ok(text.trim().to_string())
     }
 }
+
 
 // =============================================================================
 // API 実装

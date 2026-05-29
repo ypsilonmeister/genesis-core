@@ -37,3 +37,7 @@ Thumbs.db
 .claude/settings.local.json
 .antigravitycli/*
 target_repair/*
+
+# Compiled binaries and debug symbols
+*.exe
+*.pdb
