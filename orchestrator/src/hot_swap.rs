@@ -144,7 +144,7 @@ pub mod compat {
                 .unwrap_or_else(|| path.as_ref().to_string_lossy());
             file_name.hash(&mut hasher);
             let hash = hasher.finish();
-            (49152 + (hash % 16384)) as u16
+            (10000 + (hash % 35000)) as u16
         }
 
         pub struct UnixListener {

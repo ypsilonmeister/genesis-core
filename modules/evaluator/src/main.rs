@@ -631,7 +631,21 @@ async fn main() -> Result<()> {
         }
         #[cfg(not(unix))]
         {
-            let port = 49152 + (addr_or_path.len() % 16384) as u16;
+            fn path_to_port(path: impl AsRef<std::path::Path>) -> u16 {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                let file_name = path
+                    .as_ref()
+                    .file_name()
+                    .map(|f| f.to_string_lossy())
+                    .unwrap_or_else(|| path.as_ref().to_string_lossy());
+                file_name.hash(&mut hasher);
+                let hash = hasher.finish();
+                (10000 + (hash % 35000)) as u16
+            }
+
+            let port = path_to_port(&addr_or_path);
             let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
             loop {
                 let (stream, _) = listener.accept().await?;

@@ -358,6 +358,7 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     "i" => Token::I,
                     "j" => Token::J,
                     _ => {
+                        // Safe slicing: identifiers starting with 'd' or 'D' are 1-byte
                         if s_lower.starts_with('d') && s_lower.len() > 1 {
                              Token::Differential(s[1..].to_string())
                         } else {
@@ -377,20 +378,26 @@ async fn send_response<W>(writer: &mut W, request_id: String, output: Option<Str
 where W: AsyncWriteExt + Unpin {
     let response = ModuleResponse { request_id, output, error, processing_ms };
     if let Ok(payload) = serde_json::to_vec(&response) {
-        let mut payload = payload;
-        payload.push(b'\n');
-        let _ = writer.write_all(&payload).await;
+        let mut full_payload = payload;
+        full_payload.push(b'\n');
+        let _ = writer.write_all(&full_payload).await;
+        let _ = writer.flush().await;
     }
 }
 
 #[cfg(not(unix))]
-fn path_to_port(path: &str) -> u16 {
+fn path_to_port(path: impl AsRef<std::path::Path>) -> u16 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    let file_name = path
+        .as_ref()
+        .file_name()
+        .map(|f| f.to_string_lossy())
+        .unwrap_or_else(|| path.as_ref().to_string_lossy());
+    file_name.hash(&mut hasher);
     let hash = hasher.finish();
-    (49152 + (hash % 16384)) as u16
+    (10000 + (hash % 35000)) as u16
 }
 
 #[tokio::main]
@@ -467,8 +474,8 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
                 let start = std::time::Instant::now();
                 let request_val: serde_json::Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
-                    Err(_) => {
-                        send_response(&mut writer, "unknown".to_string(), None, Some(ModuleError { code: "INVALID_JSON".to_string(), message: "Failed to parse JSON".to_string(), input_position: None }), 0).await;
+                    Err(e) => {
+                        send_response(&mut writer, "unknown".to_string(), None, Some(ModuleError { code: "INVALID_JSON".to_string(), message: format!("Failed to parse JSON: {}", e), input_position: None }), 0).await;
                         continue;
                     }
                 };
