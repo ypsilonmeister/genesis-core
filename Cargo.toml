@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "orchestrator",
+    "compat",
     "modules/*",
 ]
 
@@ -14,6 +15,7 @@ repository = "https://github.com/yui-synth-lab/genesis-core"
 publish = false
 
 [workspace.dependencies]
+compat = { path = "compat" }
 # 非同期ランタイム
 tokio = { version = "1.40", features = ["full"] }
 

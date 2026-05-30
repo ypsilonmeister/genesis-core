@@ -122,6 +122,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "compat"
+version = "0.1.0"
+dependencies = [
+ "socket2 0.5.10",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -160,6 +168,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "compat",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -670,6 +679,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "compat",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -711,6 +721,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "compat",
  "reqwest",
  "rusqlite",
  "serde",
@@ -753,6 +764,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "compat",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -1324,6 +1336,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "compat",
  "serde",
  "serde_json",
  "socket2 0.5.10",

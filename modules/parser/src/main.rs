@@ -1,11 +1,10 @@
-// =============================================================================
 // # CMP Module Charter
 //
 // What:
 //   Convert a sequence of tokens into an Abstract Syntax Tree (AST) considering operator precedence.
 //
 // Invariants:
-//   - Operator precedence: * / is higher than + -
+//   - Operator precedence: ^ (power) > * / % (mod) > + -
 //   - Handle priority changes by parentheses correctly
 //   - Return an error for invalid syntax (consecutive operators, mismatched parentheses, etc.)
 //
@@ -17,15 +16,14 @@
 //   - Addition of new operators and function call syntax
 //
 // Why:
-//   Isolate syntax parsing so that the evaluator can focus on pure calculation.
-// =============================================================================
+//   Isolate syntax parsing so that the evaluator can focus on pure calculation logic.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::cell::Cell;
 use std::env;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use compat::UnixListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -57,6 +55,7 @@ pub enum Token {
     Infinity,
     Plus,
     Minus,
+    PlusMinus,
     Star,
     StarStar,
     Slash,
@@ -84,6 +83,7 @@ pub enum Token {
     Eq,
     Ne,
     Percent,
+    Mod,
     Sqrt,
     Cbrt,
     Pi,
@@ -115,22 +115,27 @@ pub enum Token {
     Ln,
     Exp,
     Abs,
+    Floor,
+    Ceil,
+    Round,
     I,
     J,
     Imaginary(f64),
-    Mod,
     Pow,
     Function(String),
     String(String),
+    Variable(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Expr {
     Number(f64),
-    Infinity,
-    NaN,
+    String(String),
     Variable(String),
+    Infinity,
+    NegInfinity,
+    NaN,
     BinOp {
         op: BinOp,
         lhs: Box<Expr>,
@@ -143,14 +148,6 @@ pub enum Expr {
     FunctionCall {
         name: String,
         args: Vec<Expr>,
-    },
-    Sequence(Vec<Expr>),
-    Log {
-        expr: Box<Expr>,
-        base: Option<Box<Expr>>,
-    },
-    Sqrt {
-        expr: Box<Expr>,
     },
 }
 
@@ -180,6 +177,7 @@ pub enum BinOp {
     Shr,
     Range,
     At,
+    PlusMinus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,591 +189,824 @@ pub enum UnaryOp {
     Percent,
     Not,
     Sqrt,
+    Cbrt,
     Log,
+    PlusMinus,
+    Log10,
+    Log2,
+    Ln,
+    Exp,
+    Abs,
+    Floor,
+    Ceil,
+    Round,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
 }
 
-const MAX_RECURSION_DEPTH: usize = 256;
+const MAX_RECURSION_DEPTH: usize = 512;
 
-struct DepthGuard<'a> {
-    depth: &'a Cell<usize>,
+pub struct Parser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+    depth: usize,
 }
 
-impl<'a> DepthGuard<'a> {
-    fn new(depth: &'a Cell<usize>) -> std::result::Result<Self, String> {
-        let d = depth.get();
-        if d >= MAX_RECURSION_DEPTH {
-            return Err("Maximum expression depth exceeded".to_string());
+fn normalize_str(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => std::char::from_u32(c as u32 - 0xFF10 + '0' as u32).unwrap_or(c),
+            '．' | '・' | '·' | '⸱' => '.',
+            '＋' => '+',
+            '－' | '−' | 'ー' | '—' | '‐' | '‑' => '-',
+            '＊' | '×' | '✕' | '✖' | '⋅' | '∗' => '*',
+            '／' | '÷' | '∕' | '∖' => '/',
+            '（' => '(',
+            '）' => ')',
+            '［' => '[',
+            '］' => ']',
+            '｛' => '{',
+            '｝' => '}',
+            '＾' => '^',
+            '＝' => '=',
+            '，' => ',',
+            '；' => ';',
+            '！' => '!',
+            '％' => '%',
+            'π' | '∏' => 'π',
+            '∞' => '∞',
+            'Σ' | '∑' => 'σ',
+            _ => c,
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+impl<'a> Parser<'a> {
+    pub fn new(tokens: &'a [Token]) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            depth: 0,
         }
-        depth.set(d + 1);
-        Ok(Self { depth })
-    }
-}
-
-impl<'a> Drop for DepthGuard<'a> {
-    fn drop(&mut self) {
-        self.depth.set(self.depth.get() - 1);
-    }
-}
-
-struct Parser {
-    tokens: Vec<Token>,
-    pos: Cell<usize>,
-    depth: Cell<usize>,
-}
-
-impl Parser {
-    fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: Cell::new(0), depth: Cell::new(0) }
     }
 
-    fn check_depth(&self) -> std::result::Result<DepthGuard<'_>, String> {
-        DepthGuard::new(&self.depth)
+    fn skip_whitespace(&mut self) {
+        while self.pos < self.tokens.len() {
+            if let Token::Variable(s) = &self.tokens[self.pos] {
+                if s.trim().is_empty() {
+                    self.pos += 1;
+                    continue;
+                }
+            }
+            break;
+        }
     }
 
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.pos.get())
+    fn peek(&mut self) -> Option<&'a Token> {
+        self.skip_whitespace();
+        self.tokens.get(self.pos)
     }
 
-    fn peek_next(&self) -> Option<&Token> {
-        self.tokens.get(self.pos.get() + 1)
+    fn peek_next(&mut self) -> Option<&'a Token> {
+        self.skip_whitespace();
+        let current_pos = self.pos;
+        self.pos += 1;
+        self.skip_whitespace();
+        let res = self.tokens.get(self.pos);
+        self.pos = current_pos;
+        res
     }
 
-    fn next(&self) -> Option<Token> {
-        let p = self.pos.get();
-        let t = self.tokens.get(p).cloned();
+    fn next(&mut self) -> Option<&'a Token> {
+        self.skip_whitespace();
+        let t = self.tokens.get(self.pos);
         if t.is_some() {
-            self.pos.set(p + 1);
+            self.pos += 1;
         }
         t
     }
 
-    fn is_function_like(&self, t: &Token) -> bool {
-        matches!(t,
-            Token::Function(_) | Token::Sin | Token::Cos | Token::Tan |
-            Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt |
-            Token::Cbrt | Token::Sum | Token::Asin | Token::Acos | Token::Atan | Token::Sinh | Token::Cosh | Token::Tanh |
-            Token::Mod | Token::Pow | Token::Integral | Token::Differential(_)
-        )
-    }
-
-    fn token_to_function_name(&self, t: &Token) -> String {
-        match t {
-            Token::Function(s) => s.clone(),
-            Token::Sin => "sin".to_string(),
-            Token::Cos => "cos".to_string(),
-            Token::Tan => "tan".to_string(),
-            Token::Log => "log".to_string(),
-            Token::Log10 => "log10".to_string(),
-            Token::Log2 => "log2".to_string(),
-            Token::Ln => "ln".to_string(),
-            Token::Exp => "exp".to_string(),
-            Token::Abs => "abs".to_string(),
-            Token::Sqrt => "sqrt".to_string(),
-            Token::Cbrt => "cbrt".to_string(),
-            Token::Sum => "sum".to_string(),
-            Token::Asin => "asin".to_string(),
-            Token::Acos => "acos".to_string(),
-            Token::Atan => "atan".to_string(),
-            Token::Sinh => "sinh".to_string(),
-            Token::Cosh => "cosh".to_string(),
-            Token::Tanh => "tanh".to_string(),
-            Token::Mod => "mod".to_string(),
-            Token::Pow => "pow".to_string(),
-            Token::Integral => "integral".to_string(),
-            Token::Differential(s) => format!("diff_{}", s),
-            _ => format!("{:?}", t).to_lowercase(),
+    fn check_depth(&mut self) -> Result<(), String> {
+        self.depth += 1;
+        if self.depth > MAX_RECURSION_DEPTH {
+            return Err("Max recursion/complexity depth exceeded".to_string());
         }
+        Ok(())
     }
 
-    fn can_start_primary(&self, t: &Token) -> bool {
-        matches!(t,
-            Token::Number(_) | Token::Pi | Token::E | Token::Infinity | Token::NaN |
-            Token::LParen | Token::LBracket | Token::LBrace |
-            Token::Function(_) | Token::Sin | Token::Cos | Token::Tan |
-            Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt |
-            Token::Cbrt | Token::Sum | Token::String(_) | Token::I | Token::J | Token::Imaginary(_) |
-            Token::Integral | Token::Differential(_) | Token::Asin | Token::Acos | Token::Atan |
-            Token::Sinh | Token::Cosh | Token::Tanh | Token::Dot
-        )
+    fn exit_depth(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
-    fn can_start_expr(&self, t: &Token) -> bool {
-        self.can_start_primary(t) || matches!(t, Token::Plus | Token::Minus | Token::Exclamation)
-    }
-
-    fn parse_expression(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
+    pub fn parse(&mut self) -> Result<Expr, String> {
+        if self.tokens.is_empty() {
+            return Err("Empty token stream".to_string());
+        }
         let mut exprs = Vec::new();
         loop {
-            while matches!(self.peek(), Some(Token::Semicolon | Token::Comma)) {
-                self.next();
+            while let Some(t) = self.peek() {
+                match t {
+                    Token::Comma | Token::Semicolon => { self.next(); }
+                    Token::Variable(s) if normalize_str(s) == "," || normalize_str(s) == ";" => { self.next(); }
+                    _ => break,
+                }
             }
             if self.peek().is_none() { break; }
-            
-            exprs.push(self.parse_assign()?);
-            
-            if matches!(self.peek(), Some(Token::Semicolon | Token::Comma)) {
-                self.next();
-                if self.peek().is_none() { break; }
-            } else {
-                break;
+            exprs.push(self.parse_expression()?);
+            if self.peek().is_none() { break; }
+        }
+        if self.pos < self.tokens.len() {
+            self.skip_whitespace();
+            if self.pos < self.tokens.len() {
+                return Err(format!("Unexpected token at position {}: {:?}", self.pos, self.tokens[self.pos]));
             }
         }
-        
-        if exprs.is_empty() {
-            Err("Empty expression".to_string())
-        } else if exprs.len() == 1 {
-            Ok(exprs.remove(0))
-        } else {
-            Ok(Expr::Sequence(exprs))
-        }
+        if exprs.is_empty() { return Err("No expression found".to_string()); }
+        if exprs.len() == 1 { Ok(exprs.remove(0)) }
+        else { Ok(Expr::FunctionCall { name: "sequence".to_string(), args: exprs }) }
     }
 
-    fn parse_assign(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let node = self.parse_logical_or()?;
-        if let Some(Token::Assign) = self.peek() {
-            self.next();
-            let rhs = self.parse_assign()?;
-            Ok(Expr::BinOp {
-                op: BinOp::Assign,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
-            })
-        } else {
-            Ok(node)
-        }
+    fn parse_expression(&mut self) -> Result<Expr, String> {
+        self.parse_assignment()
     }
 
-    fn parse_logical_or(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_logical_and()?;
-        while let Some(Token::LogicalOr) = self.peek() {
-            self.next();
-            let rhs = self.parse_logical_and()?;
-            node = Expr::BinOp {
-                op: BinOp::Or,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(node)
-    }
-
-    fn parse_logical_and(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_bitwise_or()?;
-        while let Some(Token::LogicalAnd) = self.peek() {
-            self.next();
-            let rhs = self.parse_bitwise_or()?;
-            node = Expr::BinOp {
-                op: BinOp::And,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(node)
-    }
-
-    fn parse_bitwise_or(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_bitwise_xor()?;
-        while let Some(Token::Pipe) = self.peek() {
-            self.next();
-            let rhs = self.parse_bitwise_xor()?;
-            node = Expr::BinOp {
-                op: BinOp::BitOr,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(node)
-    }
-
-    fn parse_bitwise_xor(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_bitwise_and()?;
+    fn parse_assignment(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_logical_or()?;
         while let Some(t) = self.peek() {
-            if matches!(t, Token::BitXor) {
+            let matches = match t {
+                Token::Assign => true,
+                Token::Variable(s) if normalize_str(s) == "=" => true,
+                _ => false,
+            };
+            if matches {
+                self.next();
+                let rhs = self.parse_assignment()?;
+                lhs = Expr::BinOp { op: BinOp::Assign, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_logical_and()?;
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::LogicalOr => Some(BinOp::Or),
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    if n == "||" || n == "or" { Some(BinOp::Or) } else { None }
+                }
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.next();
+                let rhs = self.parse_logical_and()?;
+                lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_bitwise_or()?;
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::LogicalAnd => Some(BinOp::And),
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    if n == "&&" || n == "and" { Some(BinOp::And) } else { None }
+                }
+                _ => None,
+            };
+            if let Some(op) = op {
+                self.next();
+                let rhs = self.parse_bitwise_or()?;
+                lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_bitwise_or(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_bitwise_xor()?;
+        while let Some(t) = self.peek() {
+            let matches = match t {
+                Token::Pipe => true,
+                Token::Variable(s) if normalize_str(s) == "|" => true,
+                _ => false,
+            };
+            if matches {
+                self.next();
+                let rhs = self.parse_bitwise_xor()?;
+                lhs = Expr::BinOp { op: BinOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_bitwise_xor(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_bitwise_and()?;
+        while let Some(t) = self.peek() {
+            let matches = match t {
+                Token::Variable(s) if normalize_str(s) == "xor" => true, 
+                _ => false,
+            };
+            if matches {
                 self.next();
                 let rhs = self.parse_bitwise_and()?;
-                node = Expr::BinOp {
-                    op: BinOp::BitXor,
-                    lhs: Box::new(node),
-                    rhs: Box::new(rhs),
-                };
-            } else {
-                break;
-            }
+                lhs = Expr::BinOp { op: BinOp::BitXor, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
         }
-        Ok(node)
+        self.exit_depth();
+        Ok(lhs)
     }
 
-    fn parse_bitwise_and(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_comparison()?;
-        while let Some(Token::Ampersand) = self.peek() {
-            self.next();
-            let rhs = self.parse_comparison()?;
-            node = Expr::BinOp {
-                op: BinOp::BitAnd,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(node)
-    }
-
-    fn parse_comparison(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_range()?;
+    fn parse_bitwise_and(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_comparison()?;
         while let Some(t) = self.peek() {
-            let op = match t {
-                Token::Eq => Some(BinOp::Eq),
-                Token::Ne => Some(BinOp::Ne),
-                Token::Lt => Some(BinOp::Lt),
-                Token::Gt => Some(BinOp::Gt),
-                Token::Le => Some(BinOp::Le),
-                Token::Ge => Some(BinOp::Ge),
-                _ => None,
+            let matches = match t {
+                Token::Ampersand => true,
+                Token::Variable(s) if normalize_str(s) == "&" => true,
+                _ => false,
             };
-            if let Some(op) = op {
+            if matches {
                 self.next();
-                let rhs = self.parse_range()?;
-                node = Expr::BinOp {
-                    op,
-                    lhs: Box::new(node),
-                    rhs: Box::new(rhs),
-                };
-            } else {
-                break;
-            }
+                let rhs = self.parse_comparison()?;
+                lhs = Expr::BinOp { op: BinOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
         }
-        Ok(node)
+        self.exit_depth();
+        Ok(lhs)
     }
 
-    fn parse_range(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_shift()?;
-        while let Some(Token::DotDot) = self.peek() {
-            self.next();
-            let rhs = self.parse_shift()?;
-            node = Expr::BinOp {
-                op: BinOp::Range,
-                lhs: Box::new(node),
-                rhs: Box::new(rhs),
-            };
-        }
-        Ok(node)
-    }
-
-    fn parse_shift(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_term()?;
+    fn parse_comparison(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_range()?;
         while let Some(t) = self.peek() {
             let op = match t {
-                Token::LShift => Some(BinOp::Shl),
-                Token::RShift => Some(BinOp::Shr),
-                _ => None,
-            };
-            if let Some(op) = op {
-                self.next();
-                let rhs = self.parse_term()?;
-                node = Expr::BinOp {
-                    op,
-                    lhs: Box::new(node),
-                    rhs: Box::new(rhs),
-                };
-            } else {
-                break;
-            }
-        }
-        Ok(node)
-    }
-
-    fn parse_term(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_factor()?;
-        while let Some(t) = self.peek() {
-            let op = match t {
-                Token::Plus => Some(BinOp::Add),
-                Token::Minus => Some(BinOp::Sub),
-                _ => None,
-            };
-            if let Some(op) = op {
-                self.next();
-                let rhs = self.parse_factor()?;
-                node = Expr::BinOp {
-                    op,
-                    lhs: Box::new(node),
-                    rhs: Box::new(rhs),
-                };
-            } else {
-                break;
-            }
-        }
-        Ok(node)
-    }
-
-    fn parse_factor(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_power()?;
-        while let Some(t) = self.peek() {
-            let op = match t {
-                Token::Star => {
-                    if self.peek_next() == Some(&Token::Star) {
-                        None // handled in parse_power
-                    } else {
-                        Some(BinOp::Mul)
+                Token::Eq => BinOp::Eq,
+                Token::Ne => BinOp::Ne,
+                Token::Lt => BinOp::Lt,
+                Token::Gt => BinOp::Gt,
+                Token::Le => BinOp::Le,
+                Token::Ge => BinOp::Ge,
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    match n.as_str() {
+                        "==" => BinOp::Eq,
+                        "!=" | "<>" => BinOp::Ne,
+                        "<" => BinOp::Lt,
+                        ">" => BinOp::Gt,
+                        "<=" => BinOp::Le,
+                        ">=" => BinOp::Ge,
+                        _ => break,
                     }
                 }
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_range()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_range(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_shift()?;
+        while let Some(t) = self.peek() {
+            let matches = match t {
+                Token::DotDot => true,
+                Token::Variable(s) if normalize_str(s) == ".." => true,
+                _ => false,
+            };
+            if matches {
+                self.next();
+                let rhs = self.parse_shift()?;
+                lhs = Expr::BinOp { op: BinOp::Range, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_term()?;
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::LShift => BinOp::Shl,
+                Token::RShift => BinOp::Shr,
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    match n.as_str() {
+                        "<<" => BinOp::Shl,
+                        ">>" => BinOp::Shr,
+                        _ => break,
+                    }
+                }
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_term()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_term(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_factor()?;
+        while let Some(t) = self.peek() {
+            let op = match t {
+                Token::Plus => BinOp::Add,
+                Token::Minus => BinOp::Sub,
+                Token::PlusMinus => BinOp::PlusMinus,
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    match n.as_str() {
+                        "+" => BinOp::Add,
+                        "-" | "−" | "ー" | "—" | "‐" | "‑" => BinOp::Sub,
+                        "±" => BinOp::PlusMinus,
+                        _ => break,
+                    }
+                }
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_factor()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        self.exit_depth();
+        Ok(lhs)
+    }
+
+    fn parse_factor(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_implicit_factor()?;
+        while let Some(t) = self.peek() {
+            let (op, consume) = match t {
+                Token::Star => (BinOp::Mul, true),
                 Token::Slash => {
-                    if self.peek_next() == Some(&Token::Slash) {
-                        Some(BinOp::FloorDiv)
-                    } else {
-                        Some(BinOp::Div)
+                    if self.peek_next().map_or(false, |nt| matches!(nt, Token::Slash) || matches!(nt, Token::DoubleSlash) || matches!(nt, Token::Variable(s) if normalize_str(s) == "/")) {
+                        self.next(); (BinOp::FloorDiv, true)
+                    } else { (BinOp::Div, true) }
+                }
+                Token::DoubleSlash => (BinOp::FloorDiv, true),
+                Token::Mod => (BinOp::Mod, true),
+                Token::At => (BinOp::At, true),
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    match n.as_str() {
+                        "*" | "×" => (BinOp::Mul, true),
+                        "/" | "÷" => {
+                            if self.peek_next().map_or(false, |nt| matches!(nt, Token::Slash) || matches!(nt, Token::DoubleSlash) || matches!(nt, Token::Variable(s2) if normalize_str(s2) == "/")) {
+                                self.next(); (BinOp::FloorDiv, true)
+                            } else { (BinOp::Div, true) }
+                        }
+                        "mod" => (BinOp::Mod, true),
+                        "//" => (BinOp::FloorDiv, true),
+                        "%" => {
+                            if let Some(next) = self.peek_next() {
+                                if Self::is_expression_start(next) && !matches!(next, Token::Plus | Token::Minus | Token::RParen | Token::RBracket | Token::RBrace | Token::Comma | Token::Semicolon) {
+                                    (BinOp::Mod, true)
+                                } else { break; }
+                            } else { break; }
+                        }
+                        _ => break,
                     }
                 }
-                Token::DoubleSlash => Some(BinOp::FloorDiv),
-                Token::Percent | Token::Mod => {
-                    let is_binary = if let Some(next_t) = self.peek_next() {
-                        self.can_start_expr(next_t)
-                    } else {
-                        false
-                    };
-                    if is_binary { Some(BinOp::Mod) } else { None }
+                Token::Percent => {
+                    if let Some(next) = self.peek_next() {
+                        if Self::is_expression_start(next) && !matches!(next, Token::Plus | Token::Minus | Token::RParen | Token::RBracket | Token::RBrace | Token::Comma | Token::Semicolon) {
+                            (BinOp::Mod, true)
+                        } else { break; }
+                    } else { break; }
                 }
-                Token::At => Some(BinOp::At),
-                _ if self.can_start_primary(t) => Some(BinOp::Mul),
-                _ => None,
+                _ => break,
             };
-            if let Some(op) = op {
-                if matches!(t, Token::Star | Token::Slash | Token::DoubleSlash | Token::Percent | Token::Mod | Token::At) {
-                    self.next();
-                    if matches!(t, Token::Slash) && op == BinOp::FloorDiv {
-                        self.next();
-                    }
-                }
-                let rhs = self.parse_power()?;
-                node = Expr::BinOp {
-                    op,
-                    lhs: Box::new(node),
-                    rhs: Box::new(rhs),
-                };
-            } else {
-                break;
-            }
+            if consume { self.next(); }
+            let rhs = self.parse_implicit_factor()?;
+            lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
-        Ok(node)
+        self.exit_depth();
+        Ok(lhs)
     }
 
-    fn parse_power(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let node = self.parse_unary()?;
-        if let Some(t) = self.peek() {
+    fn parse_implicit_factor(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_power()?;
+        while let Some(t) = self.peek() {
+            if Self::is_implicit_mul_start(t) {
+                let rhs = self.parse_power()?;
+                lhs = Expr::BinOp { op: BinOp::Mul, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
+        }
+        Ok(lhs)
+    }
+
+    fn parse_power(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_unary()?;
+        while let Some(t) = self.peek() {
             let op = match t {
-                Token::StarStar | Token::Caret | Token::Pow => Some(BinOp::Pow),
-                Token::Star if self.peek_next() == Some(&Token::Star) => Some(BinOp::Pow),
+                Token::StarStar | Token::Caret | Token::Pow | Token::BitXor => Some(BinOp::Pow),
+                Token::Star if self.peek_next().map_or(false, |nt| matches!(nt, Token::Star) || matches!(nt, Token::Variable(s) if normalize_str(s) == "*")) => {
+                    self.next(); Some(BinOp::Pow)
+                }
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    if n == "^" || n == "**" || n == "pow" { Some(BinOp::Pow) } 
+                    else if n == "*" && self.peek_next().map_or(false, |nt| matches!(nt, Token::Star) || matches!(nt, Token::Variable(s2) if normalize_str(s2) == "*")) {
+                        self.next(); Some(BinOp::Pow)
+                    }
+                    else { None }
+                }
                 _ => None,
             };
             if let Some(op) = op {
                 self.next();
-                if matches!(t, Token::Star) {
-                    self.next();
-                }
-                let rhs = self.parse_power()?;
-                return Ok(Expr::BinOp {
-                    op,
-                    lhs: Box::new(node),
-                    rhs: Box::new(rhs),
-                });
-            }
+                let rhs = self.parse_power()?; 
+                lhs = Expr::BinOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            } else { break; }
         }
-        Ok(node)
+        self.exit_depth();
+        Ok(lhs)
     }
 
-    fn parse_unary(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
+    fn parse_unary(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
         if let Some(t) = self.peek() {
             let op = match t {
-                Token::Minus => Some(UnaryOp::Neg),
                 Token::Plus => Some(UnaryOp::Pos),
+                Token::Minus => Some(UnaryOp::Neg),
+                Token::PlusMinus => Some(UnaryOp::PlusMinus),
                 Token::Exclamation => Some(UnaryOp::Not),
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    match n.as_str() {
+                        "+" => Some(UnaryOp::Pos),
+                        "-" | "−" | "ー" | "—" | "‐" | "‑" => Some(UnaryOp::Neg),
+                        "!" | "not" => Some(UnaryOp::Not),
+                        "±" => Some(UnaryOp::PlusMinus),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             if let Some(op) = op {
                 self.next();
                 let expr = self.parse_unary()?;
-                return Ok(Expr::UnaryOp {
-                    op,
-                    expr: Box::new(expr),
-                });
+                self.exit_depth();
+                return Ok(Expr::UnaryOp { op, expr: Box::new(expr) });
             }
         }
-        self.parse_postfix()
+        let res = self.parse_postfix();
+        self.exit_depth();
+        res
     }
 
-    fn parse_postfix(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let mut node = self.parse_primary()?;
+    fn parse_postfix(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let mut lhs = self.parse_primary()?;
         while let Some(t) = self.peek() {
-            let op = match t {
-                Token::Exclamation | Token::Factorial => Some(UnaryOp::Fact),
+            let (op, count) = match t {
+                Token::Factorial | Token::Exclamation => (UnaryOp::Fact, 1),
                 Token::Percent => {
-                    let is_binary = if let Some(next_t) = self.peek_next() {
-                        self.can_start_expr(next_t)
-                    } else {
-                        false
-                    };
-                    if is_binary { None } else { Some(UnaryOp::Percent) }
+                    if let Some(next) = self.peek_next() {
+                        if Self::is_expression_start(next) && !matches!(next, Token::Plus | Token::Minus | Token::RParen | Token::RBracket | Token::RBrace | Token::Comma | Token::Semicolon) {
+                            break; 
+                        }
+                    }
+                    (UnaryOp::Percent, 1)
                 }
-                _ => None,
+                Token::Variable(s) => {
+                    let n = normalize_str(s);
+                    if n.chars().all(|c| c == '!') && !n.is_empty() { (UnaryOp::Fact, n.len()) }
+                    else if n == "%" {
+                        if let Some(next) = self.peek_next() {
+                            if Self::is_expression_start(next) && !matches!(next, Token::Plus | Token::Minus | Token::RParen | Token::RBracket | Token::RBrace | Token::Comma | Token::Semicolon) {
+                                break; 
+                            }
+                        }
+                        (UnaryOp::Percent, 1)
+                    } else { break; }
+                }
+                _ => break,
             };
-            if let Some(op) = op {
-                self.next();
-                node = Expr::UnaryOp {
-                    op,
-                    expr: Box::new(node),
-                };
-            } else {
-                break;
-            }
+            self.next();
+            for _ in 0..count { lhs = Expr::UnaryOp { op, expr: Box::new(lhs) }; }
         }
-        Ok(node)
+        self.exit_depth();
+        Ok(lhs)
     }
 
-    fn parse_primary(&self) -> std::result::Result<Expr, String> {
-        let _guard = self.check_depth()?;
-        let t = match self.next() {
-            Some(t) => t,
-            None => return Err("Unexpected end of input".to_string()),
-        };
-        
-        match &t {
-            Token::Number(n) => Ok(Expr::Number(*n)),
-            Token::Pi => Ok(Expr::Number(std::f64::consts::PI)),
-            Token::E => Ok(Expr::Number(std::f64::consts::E)),
-            Token::Infinity => Ok(Expr::Infinity),
+    fn parse_primary(&mut self) -> Result<Expr, String> {
+        self.check_depth()?;
+        let t = self.next().ok_or_else(|| "Unexpected end of input".to_string())?;
+        let res = match t {
+            Token::Number(n) => self.parse_number(*n),
             Token::NaN => Ok(Expr::NaN),
+            Token::Infinity => Ok(Expr::Infinity),
+            Token::Pi => {
+                if self.is_next_call_paren() { self.parse_function_call(&Token::Pi) }
+                else { Ok(Expr::Number(std::f64::consts::PI)) }
+            }
+            Token::E => {
+                if self.is_next_call_paren() { self.parse_function_call(&Token::E) }
+                else { Ok(Expr::Number(std::f64::consts::E)) }
+            }
             Token::I => Ok(Expr::Variable("i".to_string())),
             Token::J => Ok(Expr::Variable("j".to_string())),
-            Token::Imaginary(n) => Ok(Expr::BinOp {
-                op: BinOp::Mul,
-                lhs: Box::new(Expr::Number(*n)),
-                rhs: Box::new(Expr::Variable("i".to_string())),
-            }),
-            Token::String(s) => {
-                if matches!(self.peek(), Some(Token::LParen)) {
-                    self.parse_function_call(s.clone())
-                } else {
-                    self.handle_constant_or_var(s.clone())
-                }
-            }
+            Token::Imaginary(n) => Ok(Expr::FunctionCall { name: "imaginary".to_string(), args: vec![Expr::Number(*n)] }),
+            Token::String(s) => Ok(Expr::String(s.clone())),
+            Token::LParen => self.parse_grouping(")", Token::RParen),
+            Token::LBracket => self.parse_grouping("]", Token::RBracket),
+            Token::LBrace => self.parse_grouping("}", Token::RBrace),
             Token::Dot => {
-                if let Some(Token::Number(n)) = self.peek() {
-                    self.next();
-                    let val = format!("0.{}", n);
-                    Ok(Expr::Number(val.parse::<f64>().unwrap_or(*n)))
-                } else {
-                    Ok(Expr::Number(0.0))
-                }
+                if let Some(next_t) = self.peek() {
+                    if let Some(val) = Self::get_number_value(next_t) {
+                        let digits = self.get_literal_digits(next_t);
+                        self.next();
+                        Ok(Expr::Number(val / (10.0f64.powi(digits as i32))))
+                    } else { Ok(Expr::Variable(".".to_string())) }
+                } else { Ok(Expr::Variable(".".to_string())) }
             }
-            Token::LParen | Token::LBracket | Token::LBrace => {
-                let closing = match t {
-                    Token::LParen => Token::RParen,
-                    Token::LBracket => Token::RBracket,
-                    Token::LBrace => Token::RBrace,
-                    _ => unreachable!(),
-                };
-                let node = self.parse_expression()?;
-                match self.next() {
-                    Some(ref ct) if ct == &closing => Ok(node),
-                    Some(ref ct) => Err(format!("Mismatched parentheses: expected {:?}, found {:?}", closing, ct)),
-                    None => Err(format!("Mismatched parentheses: expected {:?}, but input ended", closing)),
+            Token::Dollar => Ok(Expr::Variable("$".to_string())),
+            _ if Self::is_function(t) => self.parse_function_call(t),
+            Token::Function(s) | Token::Variable(s) => {
+                let name = normalize_str(s);
+                if name == "(" { return self.parse_grouping(")", Token::RParen); }
+                if name == "[" { return self.parse_grouping("]", Token::RBracket); }
+                if name == "{" { return self.parse_grouping("}", Token::RBrace); }
+                if name == "π" || name == "pi" {
+                    if self.is_next_call_paren() { return self.parse_function_call(&Token::Variable(name.clone())); }
+                    return Ok(Expr::Number(std::f64::consts::PI));
                 }
-            }
-            _ if self.is_function_like(&t) => {
-                let name = self.token_to_function_name(&t);
-                if matches!(self.peek(), Some(Token::LParen)) {
-                    self.parse_function_call(name)
-                } else if let Some(next_t) = self.peek() {
-                    if self.can_start_expr(next_t) {
-                        match self.parse_unary() {
-                            Ok(arg) => {
-                                match name.to_lowercase().as_str() {
-                                    "sqrt" => Ok(Expr::Sqrt { expr: Box::new(arg) }),
-                                    "log" | "ln" => Ok(Expr::Log { expr: Box::new(arg), base: None }),
-                                    _ => Ok(Expr::FunctionCall { name, args: vec![arg] }),
-                                }
-                            }
-                            Err(_) => self.handle_constant_or_var(name),
+                if name == "e" {
+                    if self.is_next_call_paren() { return self.parse_function_call(&Token::Variable(name.clone())); }
+                    return Ok(Expr::Number(std::f64::consts::E));
+                }
+                if name == "∞" || name == "inf" || name == "infinity" { return Ok(Expr::Infinity); }
+                if name == "nan" { return Ok(Expr::NaN); }
+                if name == "." {
+                    if let Some(next_t) = self.peek() {
+                        if let Some(val) = Self::get_number_value(next_t) {
+                            let digits = self.get_literal_digits(next_t);
+                            self.next();
+                            return Ok(Expr::Number(val / (10.0f64.powi(digits as i32))));
                         }
-                    } else {
-                        self.handle_constant_or_var(name)
                     }
-                } else {
-                    self.handle_constant_or_var(name)
+                    return Ok(Expr::Variable(".".to_string()));
+                }
+                if let Ok(val) = name.parse::<f64>() { self.parse_number(val) }
+                else if name.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    if let Some(pos) = name.find(|c: char| !c.is_ascii_digit() && c != '.') {
+                        let (num_part, unit_part) = name.split_at(pos);
+                        if let Ok(val) = num_part.parse::<f64>() {
+                            let num_expr = Expr::Number(val);
+                            let resolved_unit = match unit_part {
+                                "π" | "pi" => Expr::Number(std::f64::consts::PI),
+                                "e" => Expr::Number(std::f64::consts::E),
+                                "%" => return Ok(Expr::UnaryOp { op: UnaryOp::Percent, expr: Box::new(num_expr) }),
+                                "!" => return Ok(Expr::UnaryOp { op: UnaryOp::Fact, expr: Box::new(num_expr) }),
+                                _ => Expr::Variable(unit_part.to_string()),
+                            };
+                            return Ok(Expr::BinOp { op: BinOp::Mul, lhs: Box::new(num_expr), rhs: Box::new(resolved_unit) });
+                        }
+                    }
+                    Ok(Expr::Variable(name))
+                } else if self.is_next_call_paren() || Self::is_function_name(&name) { self.parse_function_call(&Token::Variable(name)) }
+                else if let Some(nt) = self.peek() {
+                    if Self::is_expression_start(nt) && !(matches!(nt, Token::Plus | Token::Minus) || matches!(nt, Token::Variable(v) if normalize_str(v) == "+" || normalize_str(v) == "-")) { 
+                        return self.parse_function_call(&Token::Variable(name)); 
+                    }
+                    Ok(Expr::Variable(name))
+                }
+                else { Ok(Expr::Variable(name)) }
+            }
+            _ => Err(format!("Unexpected token at position {}: {:?}", self.pos - 1, t)),
+        };
+        self.exit_depth();
+        res
+    }
+
+    fn parse_number(&mut self, n: f64) -> Result<Expr, String> {
+        let mut val = n;
+        while let Some(nt) = self.peek() {
+            let is_dot = match nt { Token::Dot => true, Token::Variable(s) if normalize_str(s) == "." => true, _ => false };
+            if is_dot && val.fract() == 0.0 {
+                if let Some(next_t) = self.peek_next() {
+                    if let Some(f_val_num) = Self::get_number_value(next_t) {
+                        let digits = self.get_literal_digits(next_t);
+                        self.next(); self.next();
+                        val = val + f_val_num / (10.0f64.powi(digits as i32));
+                        continue;
+                    }
                 }
             }
-            _ => Err(format!("Unexpected token in primary: {:?}", t)),
+            let is_e = match nt { Token::E => true, Token::Variable(s) => normalize_str(s) == "e", _ => false };
+            if is_e {
+                let current_pos = self.pos; self.next();
+                let mut sign = 1.0;
+                if let Some(st) = self.peek() {
+                    match st {
+                        Token::Plus => { self.next(); }
+                        Token::Minus => { sign = -1.0; self.next(); }
+                        Token::Variable(s) => {
+                            let ns = normalize_str(s);
+                            if ns == "+" { self.next(); } else if ns == "-" { sign = -1.0; self.next(); }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(et) = self.peek() {
+                    if let Some(exp) = Self::get_number_value(et) {
+                        self.next(); val = val * 10.0f64.powf(sign * exp); continue;
+                    }
+                }
+                self.pos = current_pos;
+            }
+            break;
+        }
+        Ok(Expr::Number(val))
+    }
+
+    fn get_literal_digits(&self, t: &Token) -> usize {
+        match t {
+            Token::Number(n) => {
+                let s = n.to_string();
+                if let Some(pos) = s.find('.') { s.len() - pos - 1 } else { s.len() }
+            }
+            Token::Variable(s) => s.chars().filter(|c| c.is_ascii_digit()).count(),
+            _ => 1,
         }
     }
 
-    fn handle_constant_or_var(&self, name: String) -> std::result::Result<Expr, String> {
-        match name.to_lowercase().as_str() {
-            "pi" | "π" => Ok(Expr::Number(std::f64::consts::PI)),
-            "e" => Ok(Expr::Number(std::f64::consts::E)),
-            "inf" | "infinity" | "∞" => Ok(Expr::Infinity),
-            "nan" => Ok(Expr::NaN),
-            "i" | "j" => Ok(Expr::Variable(name.to_lowercase())),
-            _ => Ok(Expr::Variable(name)),
+    fn is_next_call_paren(&mut self) -> bool {
+        self.peek().map_or(false, |pt| matches!(pt, Token::LParen) || matches!(pt, Token::Variable(v) if normalize_str(v) == "("))
+    }
+
+    fn parse_grouping(&mut self, expected_label: &str, expected_token: Token) -> Result<Expr, String> {
+        let expr = self.parse_expression()?;
+        let next_t = self.next();
+        if !next_t.map_or(false, |nt| nt == &expected_token || matches!(nt, Token::Variable(v) if normalize_str(v) == expected_label)) {
+            return Err(format!("Expected '{}'", expected_label));
+        }
+        Ok(expr)
+    }
+
+    fn get_number_value(t: &Token) -> Option<f64> {
+        match t { Token::Number(n) => Some(*n), Token::Variable(s) => normalize_str(s).parse::<f64>().ok(), _ => None }
+    }
+
+    fn is_function(t: &Token) -> bool {
+        match t {
+            Token::Sin | Token::Cos | Token::Tan | Token::Asin | Token::Acos | Token::Atan
+            | Token::Sinh | Token::Cosh | Token::Tanh | Token::Log | Token::Log10 | Token::Log2
+            | Token::Ln | Token::Exp | Token::Abs | Token::Sqrt | Token::Cbrt | Token::Sum
+            | Token::Integral | Token::Mod | Token::Pow | Token::Pi | Token::E | Token::Differential(_)
+            | Token::Floor | Token::Ceil | Token::Round => true,
+            Token::Function(s) | Token::Variable(s) => {
+                let n = normalize_str(s);
+                Self::is_function_name(&n)
+            }
+            _ => false,
         }
     }
 
-    fn parse_function_call(&self, name: String) -> std::result::Result<Expr, String> {
-        self.next(); // consume '('
+    fn is_function_name(name: &str) -> bool {
+        matches!(name, "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "log" | "log10" | "log2" | "ln" | "exp" | "abs" | "sqrt" | "cbrt" | "sum" | "σ" | "sigma" | "integral" | "mod" | "pow" | "pi" | "π" | "e" | "floor" | "ceil" | "round")
+    }
+
+    fn parse_function_call(&mut self, t: &Token) -> Result<Expr, String> {
+        let name = match t {
+            Token::Sin => "sin".to_string(), Token::Cos => "cos".to_string(), Token::Tan => "tan".to_string(),
+            Token::Asin => "asin".to_string(), Token::Acos => "acos".to_string(), Token::Atan => "atan".to_string(),
+            Token::Sinh => "sinh".to_string(), Token::Cosh => "cosh".to_string(), Token::Tanh => "tanh".to_string(),
+            Token::Log => "log".to_string(), Token::Log10 => "log10".to_string(), Token::Log2 => "log2".to_string(),
+            Token::Ln => "ln".to_string(), Token::Exp => "exp".to_string(), Token::Abs => "abs".to_string(),
+            Token::Sqrt => "sqrt".to_string(), Token::Cbrt => "cbrt".to_string(), Token::Sum => "sum".to_string(),
+            Token::Integral => "integral".to_string(), Token::Mod => "mod".to_string(), Token::Pow => "pow".to_string(),
+            Token::Pi => "pi".to_string(), Token::E => "e".to_string(),
+            Token::Floor => "floor".to_string(), Token::Ceil => "ceil".to_string(), Token::Round => "round".to_string(),
+            Token::Differential(s) | Token::Function(s) | Token::Variable(s) => {
+                let n = normalize_str(s);
+                match n.as_str() {
+                    "σ" | "sigma" | "sum" => "sum".to_string(),
+                    _ => n,
+                }
+            },
+            _ => return Err(format!("Unexpected function token: {:?}", t)),
+        };
+        if !self.is_next_call_paren() {
+            if let Some(next_t) = self.peek() {
+                if Self::is_expression_start(next_t) && !(matches!(next_t, Token::Plus | Token::Minus) || matches!(next_t, Token::Variable(v) if normalize_str(v) == "+" || normalize_str(v) == "-")) {
+                    let arg = self.parse_unary()?; return self.finalize_function_call(name, vec![arg]);
+                }
+            }
+            if name == "pi" || name == "π" { return Ok(Expr::Number(std::f64::consts::PI)); }
+            if name == "e" { return Ok(Expr::Number(std::f64::consts::E)); }
+            return Ok(Expr::Variable(name));
+        }
+        self.next();
         let mut args = Vec::new();
-        if !matches!(self.peek(), Some(Token::RParen)) && self.peek().is_some() {
-            args.push(self.parse_assign()?);
-            while matches!(self.peek(), Some(Token::Comma)) {
-                self.next();
-                args.push(self.parse_assign()?);
+        if !self.peek().map_or(false, |pt| matches!(pt, Token::RParen) || matches!(pt, Token::Variable(v) if normalize_str(v) == ")")) {
+            args.push(self.parse_assignment()?);
+            while let Some(t) = self.peek() {
+                if matches!(t, Token::Comma) || matches!(t, Token::Variable(s) if normalize_str(s) == ",") {
+                    self.next(); args.push(self.parse_assignment()?);
+                } else { break; }
             }
         }
-        if self.next() != Some(Token::RParen) {
-            return Err("Expected closing parenthesis in function call".to_string());
+        let next_t = self.next();
+        if !next_t.map_or(false, |nt| nt == &Token::RParen || matches!(nt, Token::Variable(v) if normalize_str(v) == ")")) {
+            return Err("Expected ')'".to_string());
         }
-        
-        match name.to_lowercase().as_str() {
-            "log10" => {
-                if args.is_empty() { return Err("log10 requires an argument".to_string()); }
-                Ok(Expr::Log {
-                    expr: Box::new(args.remove(0)),
-                    base: Some(Box::new(Expr::Number(10.0))),
-                })
+        self.finalize_function_call(name, args)
+    }
+
+    fn finalize_function_call(&self, name: String, mut args: Vec<Expr>) -> Result<Expr, String> {
+        if args.len() == 2 && name == "pow" {
+            return Ok(Expr::BinOp { op: BinOp::Pow, lhs: Box::new(args.remove(0)), rhs: Box::new(args.remove(0)) });
+        }
+        if args.len() == 1 {
+            match name.as_str() {
+                "sqrt" => return Ok(Expr::UnaryOp { op: UnaryOp::Sqrt, expr: Box::new(args.remove(0)) }),
+                "cbrt" => return Ok(Expr::UnaryOp { op: UnaryOp::Cbrt, expr: Box::new(args.remove(0)) }),
+                "log" => return Ok(Expr::UnaryOp { op: UnaryOp::Log, expr: Box::new(args.remove(0)) }),
+                "log10" => return Ok(Expr::UnaryOp { op: UnaryOp::Log10, expr: Box::new(args.remove(0)) }),
+                "log2" => return Ok(Expr::UnaryOp { op: UnaryOp::Log2, expr: Box::new(args.remove(0)) }),
+                "ln" => return Ok(Expr::UnaryOp { op: UnaryOp::Ln, expr: Box::new(args.remove(0)) }),
+                "exp" => return Ok(Expr::UnaryOp { op: UnaryOp::Exp, expr: Box::new(args.remove(0)) }),
+                "abs" => return Ok(Expr::UnaryOp { op: UnaryOp::Abs, expr: Box::new(args.remove(0)) }),
+                "floor" => return Ok(Expr::UnaryOp { op: UnaryOp::Floor, expr: Box::new(args.remove(0)) }),
+                "ceil" => return Ok(Expr::UnaryOp { op: UnaryOp::Ceil, expr: Box::new(args.remove(0)) }),
+                "round" => return Ok(Expr::UnaryOp { op: UnaryOp::Round, expr: Box::new(args.remove(0)) }),
+                "sin" => return Ok(Expr::UnaryOp { op: UnaryOp::Sin, expr: Box::new(args.remove(0)) }),
+                "cos" => return Ok(Expr::UnaryOp { op: UnaryOp::Cos, expr: Box::new(args.remove(0)) }),
+                "tan" => return Ok(Expr::UnaryOp { op: UnaryOp::Tan, expr: Box::new(args.remove(0)) }),
+                "asin" => return Ok(Expr::UnaryOp { op: UnaryOp::Asin, expr: Box::new(args.remove(0)) }),
+                "acos" => return Ok(Expr::UnaryOp { op: UnaryOp::Acos, expr: Box::new(args.remove(0)) }),
+                "atan" => return Ok(Expr::UnaryOp { op: UnaryOp::Atan, expr: Box::new(args.remove(0)) }),
+                "sinh" => return Ok(Expr::UnaryOp { op: UnaryOp::Sinh, expr: Box::new(args.remove(0)) }),
+                "cosh" => return Ok(Expr::UnaryOp { op: UnaryOp::Cosh, expr: Box::new(args.remove(0)) }),
+                "tanh" => return Ok(Expr::UnaryOp { op: UnaryOp::Tanh, expr: Box::new(args.remove(0)) }),
+                "pi" | "π" => return Ok(Expr::BinOp { op: BinOp::Mul, lhs: Box::new(Expr::Number(std::f64::consts::PI)), rhs: Box::new(args.remove(0)) }),
+                "sum" => return Ok(args.remove(0)),
+                _ => {}
             }
-            "log2" => {
-                if args.is_empty() { return Err("log2 requires an argument".to_string()); }
-                Ok(Expr::Log {
-                    expr: Box::new(args.remove(0)),
-                    base: Some(Box::new(Expr::Number(2.0))),
-                })
+        }
+        Ok(Expr::FunctionCall { name, args })
+    }
+
+    fn is_expression_start(t: &Token) -> bool {
+        match t {
+            Token::Number(_) | Token::NaN | Token::Infinity | Token::LParen | Token::LBracket | Token::LBrace
+            | Token::Plus | Token::Minus | Token::PlusMinus | Token::Exclamation | Token::Variable(_)
+            | Token::Function(_) | Token::Pi | Token::E | Token::I | Token::J | Token::Imaginary(_)
+            | Token::String(_) | Token::Sqrt | Token::Cbrt | Token::Abs | Token::Log | Token::Log10
+            | Token::Log2 | Token::Ln | Token::Exp | Token::Sin | Token::Cos | Token::Tan
+            | Token::Asin | Token::Acos | Token::Atan | Token::Sinh | Token::Cosh | Token::Tanh
+            | Token::Sum | Token::Integral | Token::Differential(_) | Token::At | Token::Dollar
+            | Token::Dot | Token::Mod | Token::Pow | Token::Percent | Token::Floor | Token::Ceil | Token::Round => true,
+            _ => false,
+        }
+    }
+
+    fn is_implicit_mul_start(t: &Token) -> bool {
+        match t {
+            Token::Number(_) | Token::NaN | Token::Infinity | Token::LParen | Token::LBracket | Token::LBrace
+            | Token::Pi | Token::E | Token::I | Token::J | Token::Imaginary(_) | Token::Sqrt | Token::Cbrt 
+            | Token::Abs | Token::Log | Token::Log10 | Token::Log2 | Token::Ln | Token::Exp | Token::Sin
+            | Token::Cos | Token::Tan | Token::Asin | Token::Acos | Token::Atan | Token::Sinh
+            | Token::Cosh | Token::Tanh | Token::Sum | Token::Integral | Token::Differential(_) => true,
+            Token::Function(_) => true,
+            Token::Variable(s) => {
+                let n = normalize_str(s);
+                !matches!(n.as_str(), "+" | "-" | "±" | "*" | "×" | "/" | "÷" | "mod" | "^" | "**" | "==" | "!=" | "<>" | "<" | ">" | "<=" | ">=" | "&&" | "||" | "and" | "or" | "=" | "!" | "%" | "," | ";" | ")" | "]" | "}")
             }
-            "log" | "ln" => {
-                if args.is_empty() { return Err("log requires an argument".to_string()); }
-                if args.len() == 1 {
-                    Ok(Expr::Log { expr: Box::new(args.remove(0)), base: None })
-                } else {
-                    let expr = args.remove(0);
-                    let base = args.remove(0);
-                    Ok(Expr::Log { expr: Box::new(expr), base: Some(Box::new(base)) })
-                }
-            }
-            "sqrt" => {
-                if args.is_empty() { return Err("sqrt requires an argument".to_string()); }
-                Ok(Expr::Sqrt { expr: Box::new(args.remove(0)) })
-            }
-            _ => Ok(Expr::FunctionCall { name, args }),
+            _ => false,
         }
     }
 }
@@ -783,233 +1014,47 @@ impl Parser {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("parser booting");
-
-    let socket_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/tmp/genesis-core/parser.sock".to_string());
-
+    let socket_path = env::args().nth(1).unwrap_or_else(|| "/tmp/genesis-core/parser.sock".to_string());
     let _ = std::fs::remove_file(&socket_path);
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    let listener = compat::UnixListener::bind(&socket_path)?;
-    tracing::info!("Listening on {}", socket_path);
-
+    let listener = UnixListener::bind(&socket_path)?;
+    tracing::info!("parser listening on {}", socket_path);
     loop {
         let (stream, _) = listener.accept().await?;
         tokio::spawn(async move {
-            let (reader, mut writer) = stream.split();
+            let (reader, mut writer) = tokio::io::split(stream);
             let mut reader = tokio::io::BufReader::new(reader);
-            
-            loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let start = std::time::Instant::now();
-                        let request: ModuleRequest = match serde_json::from_str(&line) {
-                            Ok(req) => req,
-                            Err(e) => {
-                                tracing::error!("Failed to parse request: {}", e);
-                                break;
-                            }
-                        };
-
-                        let tokens: Vec<Token> = match serde_json::from_str(&request.input) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let response = ModuleResponse {
-                                    request_id: request.request_id,
-                                    output: None,
-                                    error: Some(ModuleError {
-                                        code: "UNKNOWN_PATTERN".to_string(),
-                                        message: format!("Failed to parse tokens: {}", e),
-                                        input_position: None,
-                                    }),
-                                    processing_ms: start.elapsed().as_millis() as u64,
-                                };
-                                let _ = writer.write_all(&(serde_json::to_vec(&response).unwrap_or_default())).await;
-                                let _ = writer.write_all(b"\n").await;
-                                continue;
-                            }
-                        };
-
-                        let parser = Parser::new(tokens);
-                        let (output, error) = match parser.parse_expression() {
-                            Ok(expr) => {
-                                let mut has_real_trailing = false;
-                                let pos = parser.pos.get();
-                                for i in pos..parser.tokens.len() {
-                                    match &parser.tokens[i] {
-                                        Token::Semicolon | Token::Comma => {}
-                                        _ => {
-                                            has_real_trailing = true;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if has_real_trailing {
-                                    (
-                                        None,
-                                        Some(ModuleError {
-                                            code: "UNKNOWN_PATTERN".to_string(),
-                                            message: format!("Trailing tokens at position {}", pos),
-                                            input_position: Some(pos),
-                                        }),
-                                    )
-                                } else {
-                                    let json = serde_json::to_string(&expr).unwrap();
-                                    (Some(json), None)
-                                }
-                            }
-                            Err(e) => {
-                                (
-                                    None,
-                                    Some(ModuleError {
-                                        code: "UNKNOWN_PATTERN".to_string(),
-                                        message: e,
-                                        input_position: Some(parser.pos.get()),
-                                    }),
-                                )
-                            }
-                        };
-
-                        let response = ModuleResponse {
-                            request_id: request.request_id,
-                            output,
-                            error,
-                            processing_ms: start.elapsed().as_millis() as u64,
-                        };
-
-                        if let Ok(payload) = serde_json::to_vec(&response) {
-                            let mut payload = payload;
-                            payload.push(b'\n');
-                            let _ = writer.write_all(&payload).await;
-                        }
-                    }
-                    Err(_) => break,
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 { break; }
+                let start = std::time::Instant::now();
+                let request: ModuleRequest = match serde_json::from_str(&line) {
+                    Ok(req) => req,
+                    Err(_) => { line.clear(); continue; }
+                };
+                let tokens: Vec<Token> = match serde_json::from_str(&request.input) {
+                    Ok(t) => t,
+                    Err(_) => { line.clear(); continue; }
+                };
+                let mut parser = Parser::new(&tokens);
+                let (output, error) = match parser.parse() {
+                    Ok(expr) => (Some(serde_json::to_string(&expr).unwrap()), None),
+                    Err(e) => (None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: e, input_position: None })),
+                };
+                let response = ModuleResponse { request_id: request.request_id, output, error, processing_ms: start.elapsed().as_millis() as u64 };
+                if let Ok(payload) = serde_json::to_vec(&response) {
+                    let mut payload = payload; payload.push(b'\n');
+                    let _ = writer.write_all(&payload).await;
                 }
+                line.clear();
             }
+            Ok::<(), anyhow::Error>(())
         });
     }
 }
 
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,parser=debug"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-}
-
-pub mod compat {
-    #[cfg(windows)]
-    pub use windows::*;
-
-    #[cfg(unix)]
-    pub use tokio::net::{UnixListener, UnixStream};
-
-    #[cfg(windows)]
-    mod windows {
-        use std::net::SocketAddr;
-        use std::path::Path;
-        use std::pin::Pin;
-        use std::task::{Context, Poll};
-        use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-        use tokio::net::{TcpListener, TcpStream};
-
-        fn path_to_port(path: impl AsRef<Path>) -> u16 {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            let file_name = path
-                .as_ref()
-                .file_name()
-                .map(|f| f.to_string_lossy())
-                .unwrap_or_else(|| path.as_ref().to_string_lossy());
-            file_name.hash(&mut hasher);
-            let hash = hasher.finish();
-            (10000 + (hash % 35000)) as u16
-        }
-
-        pub struct UnixListener {
-            inner: TcpListener,
-        }
-
-        impl UnixListener {
-            pub fn bind(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let socket = socket2::Socket::new(
-                    socket2::Domain::IPV4,
-                    socket2::Type::STREAM,
-                    None,
-                )?;
-                socket.set_reuse_address(true)?;
-                socket.bind(&addr.into())?;
-                socket.listen(128)?;
-                let std_listener: std::net::TcpListener = socket.into();
-                let inner = TcpListener::from_std(std_listener)?;
-                Ok(Self { inner })
-            }
-
-            pub async fn accept(&self) -> std::io::Result<(UnixStream, SocketAddr)> {
-                let (stream, addr) = self.inner.accept().await?;
-                Ok((UnixStream { inner: stream }, addr))
-            }
-        }
-
-        pub struct UnixStream {
-            inner: TcpStream,
-        }
-
-        impl UnixStream {
-            pub async fn connect(path: impl AsRef<Path>) -> std::io::Result<Self> {
-                let port = path_to_port(path);
-                let addr = SocketAddr::from(([127, 0, 0, 1], port));
-                let inner = TcpStream::connect(addr).await?;
-                Ok(Self { inner })
-            }
-
-            pub fn split(self) -> (tokio::io::ReadHalf<Self>, tokio::io::WriteHalf<Self>) {
-                tokio::io::split(self)
-            }
-        }
-
-        impl AsyncRead for UnixStream {
-            fn poll_read(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &mut ReadBuf<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_read(cx, buf)
-            }
-        }
-
-        impl AsyncWrite for UnixStream {
-            fn poll_write(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-                buf: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                Pin::new(&mut self.inner).poll_write(cx, buf)
-            }
-
-            fn poll_flush(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_flush(cx)
-            }
-
-            fn poll_shutdown(
-                mut self: Pin<&mut Self>,
-                cx: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Pin::new(&mut self.inner).poll_shutdown(cx)
-            }
-        }
-    }
+    let _ = tracing_subscriber::fmt().try_init();
 }

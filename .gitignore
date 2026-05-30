@@ -41,3 +41,11 @@ target_repair/*
 # Compiled binaries and debug symbols
 *.exe
 *.pdb
+
+# スクラッチ・ワークスペース
+/scratch/
+/comparison_result.json
+/parser_tokens.txt
+/parser_variants*.txt
+/tokenizer_tokens.txt
+/tokenizer_variants*.txt

@@ -1,4 +1,3 @@
-// =============================================================================
 // # CMP Module Charter
 //
 // What:
@@ -18,15 +17,12 @@
 //   Isolate lexical analysis.
 // =============================================================================
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
-#[cfg(unix)]
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use compat::UnixListener;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRequest {
@@ -85,6 +81,7 @@ pub enum Token {
     Eq,
     Ne,
     Percent,
+    Mod,
     Sqrt,
     Cbrt,
     Pi,
@@ -116,10 +113,12 @@ pub enum Token {
     Ln,
     Exp,
     Abs,
+    Floor,
+    Ceil,
+    Round,
     I,
     J,
     Imaginary(f64),
-    Mod,
     Pow,
     Function(String),
     String(String),
@@ -128,7 +127,8 @@ pub enum Token {
 fn is_identifier_start(c: char) -> bool {
     c.is_alphabetic() || c == '_' || 
     ('α'..='ω').contains(&c) || ('Α'..='Ω').contains(&c) ||
-    c == '√' || c == '∛' || c == '∜' || c == '∞'
+    c == '√' || c == '∛' || c == '∜' || c == '∞' ||
+    ('ⓐ'..='ⓩ').contains(&c) || ('Ⓐ'..='Ⓩ').contains(&c)
 }
 
 fn is_identifier_continue(c: char) -> bool {
@@ -146,16 +146,16 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
 
         match c {
             '+' => tokens.push(Token::Plus),
-            '-' => tokens.push(Token::Minus),
-            '*' => {
-                if chars.peek().map_or(false, |&(_, next_c)| next_c == '*') {
+            '-' | '−' | '–' | '—' | '⁻' => tokens.push(Token::Minus),
+            '*' | '×' | '⋅' | '·' | '∗' => {
+                if chars.peek().map_or(false, |&(_, next_c)| next_c == '*' || next_c == '×' || next_c == '⋅' || next_c == '·' || next_c == '∗') {
                     chars.next();
                     tokens.push(Token::StarStar);
                 } else {
                     tokens.push(Token::Star);
                 }
             }
-            '/' => {
+            '/' | '÷' | '∕' | '⁄' => {
                 if chars.peek().map_or(false, |&(_, next_c)| next_c == '/') {
                     chars.next();
                     tokens.push(Token::DoubleSlash);
@@ -163,15 +163,16 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     tokens.push(Token::Slash);
                 }
             }
-            '^' => tokens.push(Token::Caret),
-            '(' => tokens.push(Token::LParen),
-            ')' => tokens.push(Token::RParen),
-            '[' => tokens.push(Token::LBracket),
-            ']' => tokens.push(Token::RBracket),
-            '{' => tokens.push(Token::LBrace),
-            '}' => tokens.push(Token::RBrace),
-            ',' => tokens.push(Token::Comma),
-            '!' => {
+            '^' | 'ˆ' | '＾' => tokens.push(Token::Caret),
+            '%' => tokens.push(Token::Mod),
+            '(' | '（' => tokens.push(Token::LParen),
+            ')' | '）' => tokens.push(Token::RParen),
+            '[' | '［' => tokens.push(Token::LBracket),
+            ']' | '］' => tokens.push(Token::RBracket),
+            '{' | '｛' => tokens.push(Token::LBrace),
+            '}' | '｝' => tokens.push(Token::RBrace),
+            ',' | '，' => tokens.push(Token::Comma),
+            '!' | '！' => {
                 if chars.peek().map_or(false, |&(_, next_c)| next_c == '=') {
                     chars.next();
                     tokens.push(Token::Ne);
@@ -179,8 +180,8 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     tokens.push(Token::Factorial);
                 }
             }
-            '?' => tokens.push(Token::Question),
-            ':' => tokens.push(Token::Colon),
+            '?' | '？' => tokens.push(Token::Question),
+            ':' | '：' => tokens.push(Token::Colon),
             '.' => {
                 if chars.peek().map_or(false, |&(_, next_c)| next_c == '.') {
                     chars.next();
@@ -191,6 +192,13 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                         if next_c.is_ascii_digit() || next_c == '_' {
                             let nc = chars.next().unwrap().1;
                             if nc != '_' { s.push(nc); }
+                        } else if next_c == 'e' || next_c == 'E' {
+                            s.push(chars.next().unwrap().1);
+                            if let Some(&(_, sign)) = chars.peek() {
+                                if sign == '+' || sign == '-' {
+                                    s.push(chars.next().unwrap().1);
+                                }
+                            }
                         } else {
                             break;
                         }
@@ -231,11 +239,12 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     tokens.push(Token::Gt);
                 }
             }
-            '%' => tokens.push(Token::Mod),
             ';' => tokens.push(Token::Semicolon),
             '√' => tokens.push(Token::Sqrt),
             '∛' => tokens.push(Token::Cbrt),
             '∜' => tokens.push(Token::Function("∜".to_string())),
+            '²' => { tokens.push(Token::Caret); tokens.push(Token::Number(2.0)); }
+            '³' => { tokens.push(Token::Caret); tokens.push(Token::Number(3.0)); }
             '@' => tokens.push(Token::At),
             '$' => tokens.push(Token::Dollar),
             '&' => {
@@ -288,7 +297,7 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
 
                 let mut has_dot = false;
                 while let Some(&(_, next_c)) = chars.peek() {
-                    if next_c.is_digit(base) || next_c == '_' {
+                    if next_c.is_digit(base as u32) || next_c == '_' {
                         let nc = chars.next().unwrap().1;
                         if nc != '_' { s.push(nc); }
                     } else if next_c == '.' && !has_dot && base == 10 {
@@ -379,6 +388,9 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
                     "ln" => Token::Ln,
                     "exp" => Token::Exp,
                     "abs" => Token::Abs,
+                    "floor" => Token::Floor,
+                    "ceil" => Token::Ceil,
+                    "round" => Token::Round,
                     "sqrt" | "√" => Token::Sqrt,
                     "cbrt" | "∛" => Token::Cbrt,
                     "sum" => Token::Sum,
@@ -406,131 +418,75 @@ pub fn tokenize(input: &str) -> std::result::Result<Vec<Token>, (String, usize)>
     Ok(tokens)
 }
 
-async fn send_response<W>(writer: &mut W, request_id: String, output: Option<String>, error: Option<ModuleError>, processing_ms: u64)
-where W: AsyncWriteExt + Unpin {
-    let response = ModuleResponse { request_id, output, error, processing_ms };
-    if let Ok(payload) = serde_json::to_vec(&response) {
-        let mut full_payload = payload;
-        full_payload.push(b'\n');
-        let _ = writer.write_all(&full_payload).await;
-        let _ = writer.flush().await;
-    }
-}
-
-#[cfg(not(unix))]
-fn path_to_port(path: impl AsRef<std::path::Path>) -> u16 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    let file_name = path.as_ref().file_name().map(|f| f.to_string_lossy()).unwrap_or_else(|| path.as_ref().to_string_lossy());
-    file_name.hash(&mut hasher);
-    let hash = hasher.finish();
-    (10000 + (hash % 35000)) as u16
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
-    tracing::info!("tokenizer booting");
+    tracing::info!("tokenizer booting (v1)");
 
-    let addr_or_path = env::args().nth(1).unwrap_or_else(|| "/tmp/genesis-core/tokenizer.sock".to_string());
+    let socket_path = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "/tmp/genesis-core/tokenizer.sock".to_string());
 
-    if addr_or_path.starts_with("tcp://") {
-        let addr_str = addr_or_path.strip_prefix("tcp://").context("Invalid TCP address format")?;
-        let listener = TcpListener::bind(addr_str).await.context(format!("Failed to bind to TCP {}", addr_str))?;
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => { tokio::spawn(async move { let _ = handle_client(stream).await; }); }
-                Err(e) => { tracing::error!("accept error: {}", e); }
-            }
-        }
-    } else {
-        #[cfg(unix)]
-        {
-            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-            let _ = std::fs::remove_file(uds_path);
-            if let Some(parent) = std::path::Path::new(uds_path).parent() { let _ = std::fs::create_dir_all(parent); }
-            let listener = UnixListener::bind(uds_path).context(format!("Failed to bind to UDS {}", uds_path))?;
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => { tokio::spawn(async move { let _ = handle_client(stream).await; }); }
-                    Err(e) => { tracing::error!("accept error: {}", e); }
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let uds_path = addr_or_path.strip_prefix("uds://").unwrap_or(&addr_or_path);
-            let port = path_to_port(uds_path);
-            let addr = SocketAddr::from(([127, 0, 0, 1], port));
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                None,
-            )?;
-            socket.set_reuse_address(true)?;
-            socket.bind(&addr.into())?;
-            socket.listen(128)?;
-            let std_listener: std::net::TcpListener = socket.into();
-            std_listener.set_nonblocking(true)?;
-            let listener = TcpListener::from_std(std_listener)?;
-            tracing::info!("tokenizer listening on TCP {}", addr);
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => { tokio::spawn(async move { let _ = handle_client(stream).await; }); }
-                    Err(e) => { tracing::error!("accept error: {}", e); }
-                }
-            }
-        }
+    let _ = std::fs::remove_file(&socket_path);
+    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+        std::fs::create_dir_all(parent)?;
     }
-}
 
-async fn handle_client<S>(stream: S) -> Result<()>
-where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
+    let listener = UnixListener::bind(&socket_path)?;
+    tracing::info!("Listening on {}", socket_path);
 
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
+        let (stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut reader = tokio::io::BufReader::new(reader);
+            let mut line = String::new();
+
+            if let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    return;
+                }
                 let start = std::time::Instant::now();
-                let request_val: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
+                let request: ModuleRequest = match serde_json::from_str(&line) {
+                    Ok(req) => req,
                     Err(e) => {
-                        send_response(&mut writer, "unknown".to_string(), None, Some(ModuleError { code: "INVALID_JSON".to_string(), message: format!("Failed to parse JSON: {}", e), input_position: None }), 0).await;
-                        continue;
+                        tracing::error!("Failed to parse request: {}", e);
+                        return;
                     }
                 };
 
-                let request_id = request_val["request_id"].as_str().map(|s| s.to_string()).unwrap_or_else(|| request_val["request_id"].to_string());
-                let input = match request_val["input"].as_str() {
-                    Some(s) => s,
-                    None => {
-                        send_response(&mut writer, request_id, None, Some(ModuleError { code: "INVALID_REQUEST".to_string(), message: "Missing input field".to_string(), input_position: None }), 0).await;
-                        continue;
-                    }
+                let (output, error) = match tokenize(&request.input) {
+                    Ok(tokens) => (Some(serde_json::to_string(&tokens).unwrap()), None),
+                    Err((msg, pos)) => (
+                        None,
+                        Some(ModuleError {
+                            code: "SYNTAX_ERROR".to_string(),
+                            message: msg,
+                            input_position: Some(pos),
+                        }),
+                    ),
                 };
 
-                match tokenize(input) {
-                    Ok(tokens) => {
-                        match serde_json::to_string(&tokens) {
-                            Ok(output) => { send_response(&mut writer, request_id, Some(output), None, start.elapsed().as_millis() as u64).await; }
-                            Err(e) => { send_response(&mut writer, request_id, None, Some(ModuleError { code: "SERIALIZATION_ERROR".to_string(), message: e.to_string(), input_position: None }), start.elapsed().as_millis() as u64).await; }
-                        }
-                    }
-                    Err((msg, pos)) => {
-                        send_response(&mut writer, request_id, None, Some(ModuleError { code: "UNKNOWN_PATTERN".to_string(), message: msg, input_position: Some(pos) }), start.elapsed().as_millis() as u64).await;
-                    }
+                let response = ModuleResponse {
+                    request_id: request.request_id,
+                    output,
+                    error,
+                    processing_ms: start.elapsed().as_millis() as u64,
+                };
+
+                if let Ok(payload) = serde_json::to_vec(&response) {
+                    let mut payload = payload;
+                    payload.push(b'\n');
+                    let _ = writer.write_all(&payload).await;
                 }
             }
-            Err(_) => break,
-        }
+        });
     }
-    Ok(())
 }
 
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt().try_init();
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,tokenizer=debug"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
