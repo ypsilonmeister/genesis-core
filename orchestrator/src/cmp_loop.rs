@@ -574,11 +574,38 @@ impl CmpLoop {
                 Unknown pattern examples: {examples}\n\n\
                 Current module chain: {chain_desc}\n\n\
                 Requirements:\n\
-                - Module must receive and return JSON over UDS (Unix Domain Socket)\n\
-                - Use the same communication protocol as existing modules (modules/normalizer)\n\
+                - Module must receive and return JSON over the socket\n\
+                - CRITICAL (cross-platform): import the listener/stream from the `compat` crate, NOT from tokio. \
+                Use `use compat::UnixListener;` and (if connecting downstream) `use compat::UnixStream;`. \
+                NEVER write `use tokio::net::UnixListener` / `UnixStream` — it is `#[cfg(unix)]`-gated and fails to build on Windows.\n\
                 - Include CMP Module Charter comment at the top\n\
-                - Keep code and Cargo.toml extremely concise and minimal to prevent token overflow.\n\
-                - Limit Cargo.toml dependencies to only necessary ones (tokio, serde, serde_json, thiserror, anyhow, tracing). Do not include unnecessary packages.\n\n\
+                - Keep main.rs concise to prevent token overflow.\n\
+                - Cargo.toml MUST use workspace dependencies exactly as below (do NOT pin versions or features yourself; \
+                tokio's features come from the workspace as `full`). Use this template verbatim, replacing only the package/bin name:\n\
+                [package]\n\
+                name = \"<module_name>\"\n\
+                version = \"0.1.0\"\n\
+                edition.workspace = true\n\
+                rust-version.workspace = true\n\
+                license.workspace = true\n\
+                authors.workspace = true\n\
+                repository.workspace = true\n\
+                publish.workspace = true\n\
+                [[bin]]\n\
+                name = \"<module_name>\"\n\
+                path = \"src/main.rs\"\n\
+                [dependencies]\n\
+                tokio = {{ workspace = true }}\n\
+                serde = {{ workspace = true }}\n\
+                serde_json = {{ workspace = true }}\n\
+                thiserror = {{ workspace = true }}\n\
+                anyhow = {{ workspace = true }}\n\
+                tracing = {{ workspace = true }}\n\
+                tracing-subscriber = {{ workspace = true }}\n\
+                uuid = {{ workspace = true }}\n\
+                chrono = {{ workspace = true }}\n\
+                socket2 = {{ workspace = true }}\n\
+                compat = {{ workspace = true }}\n\n\
                 Output format: JSON only (no explanation needed)\n\
                 IMPORTANT: When embedding multi-line source code like \"cargo_toml\" and \"main_rs\" in JSON, properly escape: newlines as \\n, double quotes as \\\", backslashes as \\\\. Output valid JSON.\n\
                 {{\n\
