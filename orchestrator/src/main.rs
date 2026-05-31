@@ -198,6 +198,8 @@ async fn main() -> Result<()> {
             let mut current = input.clone();
             let mut chain_error: Option<(String, String)> = None;
 
+            let mut to_restart: Option<(String, String, String)> = None;
+
             'chain: for (m, _proc) in &processes {
                 let req = ModuleRequest {
                     request_id: request_id.clone(),
@@ -217,9 +219,27 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        error!(module = %m.name, err = %e, "IPC failure");
+                        error!(module = %m.name, err = %e, "IPC failure — marking for restart");
+                        to_restart = Some((m.name.clone(), m.binary.clone(), m.socket.clone()));
                         chain_error = Some((m.name.clone(), "ModuleCrash".to_string()));
                         break 'chain;
+                    }
+                }
+            }
+
+            if let Some((name, binary, socket)) = to_restart {
+                match ModuleProcess::spawn(&name, &binary, &socket).await {
+                    Ok(new_proc) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if let Some(idx) =
+                            processes.iter().position(|(m_cfg, _)| m_cfg.name == name)
+                        {
+                            processes[idx].1 = new_proc;
+                        }
+                        info!(module = %name, "Successfully restarted crashed module");
+                    }
+                    Err(restart_err) => {
+                        error!(module = %name, err = %restart_err, "Failed to restart crashed module");
                     }
                 }
             }
@@ -292,6 +312,7 @@ async fn main() -> Result<()> {
                                     hot_swapper: &swapper,
                                     old_child: proc.child,
                                     metadata: &metadata,
+                                    trigger_inputs: std::slice::from_ref(input),
                                 })
                                 .await
                             {
@@ -306,8 +327,15 @@ async fn main() -> Result<()> {
                                         .stdout(Stdio::null())
                                         .stderr(Stdio::null())
                                         .spawn()
-                                        .context("Failed to restart module after internal repair error")?;
-                                    (RepairOutcome::Rejected { reason: format!("Internal error: {}", e) }, restarted_child)
+                                        .context(
+                                            "Failed to restart module after internal repair error",
+                                        )?;
+                                    (
+                                        RepairOutcome::Rejected {
+                                            reason: format!("Internal error: {}", e),
+                                        },
+                                        restarted_child,
+                                    )
                                 }
                             };
 
@@ -381,7 +409,9 @@ async fn main() -> Result<()> {
                         Ok(res) => res,
                         Err(e) => {
                             error!(err = %e, "Tier 2 repair failed unexpectedly");
-                            Tier2Outcome::Rejected { reason: format!("Internal error: {}", e) }
+                            Tier2Outcome::Rejected {
+                                reason: format!("Internal error: {}", e),
+                            }
                         }
                     };
 
@@ -407,13 +437,20 @@ async fn main() -> Result<()> {
                                     }
                                     Err(e) => {
                                         warn!(err = %e, "Tier 2 hot_swap failed, attempting to restart from binary");
-                                        let restarted_child = ModuleProcess::spawn(&m_cfg.name, &m_cfg.binary, &m_cfg.socket).await;
-                                        
+                                        let restarted_child = ModuleProcess::spawn(
+                                            &m_cfg.name,
+                                            &m_cfg.binary,
+                                            &m_cfg.socket,
+                                        )
+                                        .await;
+
                                         match restarted_child {
                                             Ok(c) => {
                                                 processes.insert(idx, (m_cfg, c));
                                             }
-                                            Err(e2) => error!(err = %e2, "Failed to restart module after hot_swap failure"),
+                                            Err(e2) => {
+                                                error!(err = %e2, "Failed to restart module after hot_swap failure")
+                                            }
                                         }
                                     }
                                 }

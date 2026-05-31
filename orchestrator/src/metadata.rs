@@ -50,7 +50,8 @@ impl MetadataStore {
                 test_result TEXT,
                 decision TEXT NOT NULL,
                 rejection_reason TEXT,
-                adopted_at TEXT
+                adopted_at TEXT,
+                trigger_inputs TEXT
             );
 
             CREATE TABLE IF NOT EXISTS attacks (
@@ -105,8 +106,8 @@ impl MetadataStore {
                 timestamp, tier, module_name, trigger_type, trigger_count,
                 prompt_full, model_name, generated_code,
                 build_result, build_error, test_result,
-                decision, rejection_reason, adopted_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                decision, rejection_reason, adopted_at, trigger_inputs
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     rec.timestamp,
                     rec.tier,
@@ -122,6 +123,7 @@ impl MetadataStore {
                     rec.decision,
                     rec.rejection_reason,
                     rec.adopted_at,
+                    rec.trigger_inputs,
                 ],
             )
             .context("Failed to insert modification")?;
@@ -186,7 +188,20 @@ impl MetadataStore {
         Ok(self.conn.last_insert_rowid())
     }
 
-    #[allow(dead_code)]
+    /// 指定モジュールの次のスナップショット version 番号を返す (現在の最大 + 1)。
+    /// SELECT のみで破壊的操作ではないため HI-3 に抵触しない。
+    pub fn next_snapshot_version(&self, module_name: &str) -> Result<i64> {
+        let v: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM module_snapshots WHERE module_name = ?1",
+                params![module_name],
+                |row| row.get(0),
+            )
+            .context("Failed to compute next snapshot version")?;
+        Ok(v)
+    }
+
     pub fn insert_module_snapshot(
         &self,
         module_name: &str,
@@ -229,4 +244,7 @@ pub struct ModificationRecord {
     pub decision: String,            // "adopted" | "rejected"
     pub rejection_reason: Option<String>,
     pub adopted_at: Option<String>,
+    /// この改変を発火させた実際の未知入力群 (JSON 配列文字列)。
+    /// チャーン/収束分析のため、どの入力が何度修復対象になったかを追跡する。
+    pub trigger_inputs: Option<String>,
 }

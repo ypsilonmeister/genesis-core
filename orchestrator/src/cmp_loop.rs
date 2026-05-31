@@ -45,6 +45,8 @@ pub struct RepairContext<'a> {
     pub hot_swapper: &'a HotSwapper,
     pub old_child: Child,
     pub metadata: &'a MetadataStore,
+    /// この修復を発火させた実際の入力群 (チャーン分析用)。
+    pub trigger_inputs: &'a [String],
 }
 
 pub struct CmpLoop {
@@ -87,6 +89,7 @@ impl CmpLoop {
             hot_swapper,
             old_child,
             metadata,
+            trigger_inputs,
         } = ctx;
 
         if error_count < self.tier1_trigger {
@@ -102,7 +105,10 @@ impl CmpLoop {
         // コードが既に壊れている（空 main / 行数が極端に少ない）場合は現在のコードを
         // ベースにせず、エラー情報だけを渡す。
         let code_looks_broken = module_code.lines().count() < 20
-            || (module_code.contains("fn main()") && !module_code.contains("async fn main") && !module_code.contains("UnixListener") && !module_code.contains("TcpListener"));
+            || (module_code.contains("fn main()")
+                && !module_code.contains("async fn main")
+                && !module_code.contains("UnixListener")
+                && !module_code.contains("TcpListener"));
 
         let code_section = if code_looks_broken {
             format!(
@@ -244,6 +250,7 @@ impl CmpLoop {
                 decision: "rejected".to_string(),
                 rejection_reason: Some(rejection_reason.to_string()),
                 adopted_at: None,
+                trigger_inputs: serde_json::to_string(trigger_inputs).ok(),
             };
             metadata.insert_modification(&rec)?;
             return Ok((
@@ -263,11 +270,13 @@ impl CmpLoop {
             .context("Failed to kill old process before copying repair binary")?;
 
         // Copy the tested repair binary from target_repair to the final location
-        let repair_binary_path = format!("target_repair/debug/{}{}",
+        let repair_binary_path = format!(
+            "target_repair/debug/{}{}",
             module_name,
             if cfg!(windows) { ".exe" } else { "" }
         );
-        let final_binary_path = format!("target/debug/{}{}",
+        let final_binary_path = format!(
+            "target/debug/{}{}",
             module_name,
             if cfg!(windows) { ".exe" } else { "" }
         );
@@ -276,7 +285,8 @@ impl CmpLoop {
             .context("Failed to copy repair binary to final location")?;
 
         info!(module = %module_name, "Tier 1: starting new process");
-        let new_child = self.executor
+        let new_child = self
+            .executor
             .spawn_process(&hot_swapper.binary_path, &hot_swapper.socket_path)
             .await
             .context("Failed to spawn new module process")?;
@@ -299,8 +309,10 @@ impl CmpLoop {
             decision: "adopted".to_string(),
             rejection_reason: None,
             adopted_at: Some(adopted_at),
+            trigger_inputs: serde_json::to_string(trigger_inputs).ok(),
         };
-        metadata.insert_modification(&rec)?;
+        let mod_id = metadata.insert_modification(&rec)?;
+        record_snapshot(metadata, module_name, rec.generated_code.as_deref(), mod_id);
 
         info!(module = %module_name, "Tier 1: repair adopted and recorded");
         Ok((RepairOutcome::Adopted, new_child))
@@ -408,7 +420,10 @@ impl CmpLoop {
 
             // コードが壊れていればベースにしない
             let code_looks_broken = module_code.lines().count() < 20
-                || (module_code.contains("fn main()") && !module_code.contains("async fn main") && !module_code.contains("UnixListener") && !module_code.contains("TcpListener"));
+                || (module_code.contains("fn main()")
+                    && !module_code.contains("async fn main")
+                    && !module_code.contains("UnixListener")
+                    && !module_code.contains("TcpListener"));
 
             let code_section = if code_looks_broken {
                 format!(
@@ -537,6 +552,7 @@ impl CmpLoop {
                     decision: "rejected".to_string(),
                     rejection_reason: Some(rejection_reason.to_string()),
                     adopted_at: None,
+                    trigger_inputs: serde_json::to_string(unknown_inputs).ok(),
                 };
                 metadata.insert_modification(&rec)?;
                 return Ok(Tier2Outcome::Rejected {
@@ -560,8 +576,10 @@ impl CmpLoop {
                 decision: "adopted".to_string(),
                 rejection_reason: None,
                 adopted_at: Some(adopted_at),
+                trigger_inputs: serde_json::to_string(unknown_inputs).ok(),
             };
-            metadata.insert_modification(&rec)?;
+            let mod_id = metadata.insert_modification(&rec)?;
+            record_snapshot(metadata, target, rec.generated_code.as_deref(), mod_id);
             info!(target, "Tier 2: extension adopted");
             Ok(Tier2Outcome::Extended {
                 module_name: target.to_string(),
@@ -642,8 +660,7 @@ impl CmpLoop {
                             current_prompt = format!(
                                 "{}\n\nYour previous output had the following parse error:\n{}\n\n\
                                 Fix the above error and output only properly escaped, valid JSON.",
-                                new_mod_prompt,
-                                e
+                                new_mod_prompt, e
                             );
                         }
                     }
@@ -748,6 +765,7 @@ impl CmpLoop {
                     decision: "rejected".to_string(),
                     rejection_reason: Some("build or test failed".to_string()),
                     adopted_at: None,
+                    trigger_inputs: serde_json::to_string(unknown_inputs).ok(),
                 };
                 metadata.insert_modification(&rec)?;
                 return Ok(Tier2Outcome::Rejected {
@@ -777,8 +795,10 @@ impl CmpLoop {
                 decision: "adopted".to_string(),
                 rejection_reason: None,
                 adopted_at: Some(adopted_at),
+                trigger_inputs: serde_json::to_string(unknown_inputs).ok(),
             };
-            metadata.insert_modification(&rec)?;
+            let mod_id = metadata.insert_modification(&rec)?;
+            record_snapshot(metadata, &mod_name, rec.generated_code.as_deref(), mod_id);
 
             info!(mod_name = %mod_name, "Tier 2: new module adopted");
             Ok(Tier2Outcome::NewModule(NewModuleSpec {
@@ -800,10 +820,15 @@ impl CmpLoop {
     ) -> Result<()> {
         let charter_what = extract_charter_what(source_code);
 
-        // Step 1: Claude にモジュールの1文要約を生成させる
+        // Step 1: Claude にモジュールの1文要約を生成させる。
+        // 要約は ENGLISH (ASCII) で出させる。日本語の多バイト文字は Windows 環境の
+        // 取り込み経路で U+FFFD 化して保存破損する事例が run1 で確認されたため、
+        // 指標を ASCII に固定して破損を構造的に回避する。charter_what はソースから
+        // strict UTF-8 で読むため日本語のままで無傷。判定 (Step 2) は意味ベースで言語非依存。
         let summary_prompt = format!(
-            "以下のRustモジュールを読んで、このモジュールが外部からどのように使われるか \
-            (何を受け取り何を返すか) を1文で説明してください。説明のみを出力し、他の文字は不要です。\n\n\
+            "Read the following Rust module and describe, in ONE English sentence, \
+            how it is used from the outside (what it receives and what it returns). \
+            Output only the sentence, in English, with no other text.\n\n\
             ```rust\n{source_code}\n```"
         );
 
@@ -930,6 +955,37 @@ pub struct NewModuleSpec {
     pub binary_path: String,
     pub socket_path: String,
     pub insert_after: Option<String>,
+}
+
+/// 採用されたコードをコード系統樹 (module_snapshots) に記録する。
+/// version はモジュールごとに自動採番する。スナップショット記録の失敗は
+/// CMP ループ本体を止めるべきではないため、警告ログのみで握り潰す。
+fn record_snapshot(
+    metadata: &MetadataStore,
+    module_name: &str,
+    code: Option<&str>,
+    modification_id: i64,
+) {
+    let Some(code) = code else {
+        warn!(module = %module_name, "snapshot skipped: no generated_code");
+        return;
+    };
+    match metadata.next_snapshot_version(module_name) {
+        Ok(version) => {
+            if let Err(e) = metadata.insert_module_snapshot(
+                module_name,
+                version,
+                code,
+                &extract_charter(code),
+                Some(modification_id),
+            ) {
+                warn!(module = %module_name, err = %e, "failed to record module snapshot");
+            }
+        }
+        Err(e) => {
+            warn!(module = %module_name, err = %e, "failed to compute snapshot version")
+        }
+    }
 }
 
 /// Charter コメントの What: セクションを抽出する (複数行対応)。
@@ -1190,6 +1246,7 @@ mod tests {
                 hot_swapper: &fake_swapper(),
                 old_child,
                 metadata: &metadata,
+                trigger_inputs: &[],
             })
             .await
             .unwrap();
@@ -1233,6 +1290,7 @@ mod tests {
                 hot_swapper: &fake_swapper(),
                 old_child,
                 metadata: &metadata,
+                trigger_inputs: &[],
             })
             .await
             .unwrap();
@@ -1269,6 +1327,7 @@ mod tests {
                 hot_swapper: &fake_swapper(),
                 old_child,
                 metadata: &metadata,
+                trigger_inputs: &[],
             })
             .await
             .unwrap();
@@ -1306,6 +1365,7 @@ mod tests {
                 hot_swapper: &fake_swapper(),
                 old_child,
                 metadata: &metadata,
+                trigger_inputs: &[],
             })
             .await
             .unwrap();
@@ -1544,12 +1604,16 @@ mod tests {
             recorded
         );
         assert!(
-            recorded.iter().any(|o| matches!(o, Op::CargoBuild(s) if s == "normalizer (repair)")),
+            recorded
+                .iter()
+                .any(|o| matches!(o, Op::CargoBuild(s) if s == "normalizer (repair)")),
             "CargoBuild(normalizer (repair)) must be recorded; ops={:?}",
             recorded
         );
         assert!(
-            recorded.iter().any(|o| matches!(o, Op::CargoTest(s) if s == "normalizer (repair)")),
+            recorded
+                .iter()
+                .any(|o| matches!(o, Op::CargoTest(s) if s == "normalizer (repair)")),
             "CargoTest(normalizer (repair)) must be recorded; ops={:?}",
             recorded
         );
@@ -1656,12 +1720,16 @@ mod tests {
         );
         let recorded = ops.lock().unwrap().clone();
         assert!(
-            recorded.iter().any(|o| matches!(o, Op::CargoBuild(s) if s == "normalizer (repair)")),
+            recorded
+                .iter()
+                .any(|o| matches!(o, Op::CargoBuild(s) if s == "normalizer (repair)")),
             "CargoBuild(normalizer (repair)) must be recorded; ops={:?}",
             recorded
         );
         assert!(
-            recorded.iter().any(|o| matches!(o, Op::CargoTest(s) if s == "normalizer (repair)")),
+            recorded
+                .iter()
+                .any(|o| matches!(o, Op::CargoTest(s) if s == "normalizer (repair)")),
             "CargoTest(normalizer (repair)) must be recorded even on failure; ops={:?}",
             recorded
         );
