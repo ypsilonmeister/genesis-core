@@ -2,26 +2,27 @@
 // # CMP Module Charter
 //
 // What:
-//   正規化済み文字列を数値・演算子・括弧のトークン列に分解する。
+//   Decompose a normalized string into a sequence of number / operator / parenthesis tokens.
 //
 // Invariants:
-//   - 認識できないトークンはエラーとして返す(サイレント無視禁止)
-//   - トークン列の順序は入力順を保持する
+//   - Return unrecognized tokens as errors (silent skipping is forbidden)
+//   - Preserve the input order of the token sequence
 //
 // Boundaries:
-//   - 依存先: normalizer
-//   - 被依存先: parser
+//   - Dependencies: normalizer
+//   - Dependents: parser
 //
 // Extensible:
-//   - 認識トークンの種類追加 (関数名、定数、単位、etc.)
+//   - Additional recognized token kinds (function names, constants, units, etc.)
 //
 // Why:
-//   parser が文法解析に集中できるよう、字句解析を分離する。
+//   Separate lexical analysis so that the parser can focus on grammar parsing.
 // =============================================================================
 
-// v1 実装範囲:
-//   ASCII 数字・小数点・四則演算子 (+ - * /)・括弧 ( ) のみ認識。
-//   全角数字・全角演算子・自然言語等は UnknownToken エラー。
+// v1 scope:
+//   Recognize only ASCII digits, the decimal point, the four arithmetic operators
+//   (+ - * /), and parentheses ( ). Full-width digits, full-width operators,
+//   natural language, etc. produce an UnknownToken error.
 
 use anyhow::Result;
 use compat::UnixListener;
@@ -130,7 +131,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
     Ok(tokens)
 }
 
-// 小さなヘルパ: トークンを push して 1 文字進める
+// Small helper: push a token and advance one character
 trait NextPush {
     fn next_push<I: Iterator>(&mut self, t: Token, chars: &mut std::iter::Peekable<I>);
 }

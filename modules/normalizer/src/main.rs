@@ -2,28 +2,29 @@
 // # CMP Module Charter
 //
 // What:
-//   入力文字列を正規化して後続モジュールに渡す(空白除去のみ)。
+//   Normalize the input string and pass it to the next module (whitespace removal only).
 //
 // Invariants:
-//   - 入力文字列を破壊的に変更しない(元の入力はログに残す)
-//   - 空文字列を受け取った場合はエラーを返す
+//   - Do not destructively modify the input string (keep the original in logs)
+//   - Return an error when an empty string is received
 //
 // Boundaries:
-//   - 依存先: なし
-//   - 被依存先: tokenizer
+//   - Dependencies: none
+//   - Dependents: tokenizer
 //
 // Extensible:
-//   - 正規化ルールの追加 (全角→半角変換、不可視文字除去、etc.)
+//   - Additional normalization rules (full-width to half-width, invisible char removal, etc.)
 //
 // Why:
-//   後続モジュールが純粋な解析に集中できるよう、表層的なノイズを除去する。
+//   Strip surface-level noise so that downstream modules can focus on pure parsing.
 //
-// Tier 1 で AI が改変するときは、上記 Invariants と Boundaries を絶対に
-// 破らないこと。What の範囲を超える変更は Tier 2 として扱う。
+// When the AI modifies this in Tier 1, it must never break the Invariants and
+// Boundaries above. Changes beyond the scope of What are handled as Tier 2.
 // =============================================================================
 
-// v1 実装範囲:
-//   連続空白を単一空白に圧縮、前後空白をトリム。それ以外は素通し。
+// v1 scope:
+//   Collapse consecutive whitespace into a single space and trim the edges.
+//   Everything else passes through.
 
 use anyhow::Result;
 use compat::UnixListener;
@@ -62,9 +63,9 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "/tmp/genesis-core/normalizer.sock".to_string());
 
-    // 以前のソケットファイルを削除
+    // Remove any pre-existing socket file
     let _ = std::fs::remove_file(&socket_path);
-    // ディレクトリ作成
+    // Create the directory
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -121,9 +122,9 @@ async fn main() -> Result<()> {
     }
 }
 
-/// 連続空白を単一空白に圧縮し、前後空白をトリムする。
-/// 元の入力は破壊しない(参照を借りるだけ)。
-/// 空文字列の場合はエラーを返す。
+/// Collapse consecutive whitespace into a single space and trim the edges.
+/// Does not destroy the original input (only borrows a reference).
+/// Returns an error for an empty string.
 pub fn normalize(input: &str) -> Result<String, String> {
     if input.trim().is_empty() {
         return Err("Empty input".to_string());
@@ -154,7 +155,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_error() {
-        // Charter: 空文字列を受け取った場合はエラーを返す
+        // Charter: return an error when an empty string is received
         assert!(normalize("").is_err());
         assert!(normalize("   ").is_err());
     }

@@ -2,22 +2,22 @@
 // # CMP Module Charter
 //
 // What:
-//   AST を受け取り計算結果 (f64) を返す。
+//   Receive an AST and return the computation result (f64).
 //
 // Invariants:
-//   - ゼロ除算はエラーを返す (パニック禁止)
-//   - オーバーフローはエラーを返す (サイレント無視禁止)
-//   - 計算結果は入力と同一の f64 精度で返す
+//   - Division by zero returns an error (panicking is forbidden)
+//   - Overflow returns an error (silent skipping is forbidden)
+//   - Return the result at the same f64 precision as the input
 //
 // Boundaries:
-//   - 依存先: parser
-//   - 被依存先: orchestrator (最終出力)
+//   - Dependencies: parser
+//   - Dependents: orchestrator (final output)
 //
 // Extensible:
-//   - 新しいノードタイプ (関数呼び出し、変数参照等) の評価
+//   - Evaluation of new node types (function calls, variable references, etc.)
 //
 // Why:
-//   計算ロジックを分離し、parser の変更が evaluator に波及しないようにする。
+//   Separate calculation logic so that parser changes do not ripple into the evaluator.
 // =============================================================================
 
 use anyhow::Result;
